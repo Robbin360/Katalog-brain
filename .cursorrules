@@ -1,0 +1,8 @@
+# KATALOG AI 2.0 - AGENT OS RULES
+- Role: Senior Python 3.13 Architect.
+- Tech Stack: FastAPI, LangGraph, PydanticAI, Letta-client, Supabase (Service Role).
+- Goal: E-commerce Revenue Optimization (Text-to-text only. NO image processing).
+- Typing: Strict typing is MANDATORY. Always use Pydantic BaseModels for LLM structured outputs and internal state passing.
+- Workflow: LangGraph is the orchestrator. PydanticAI handles specific LLM calls to ensure JSON schema adherence. Letta handles long-term memory via client API.
+- Database: Supabase target table is `shopify_products`. Do NOT invent table names.
+- Rule: Never write unstructured responses. Always wrap agent outputs in Pydantic models.

@@ -1,0 +1,15 @@
+# Katalog AI 2.0 — Python backend
+# Target: Python 3.13+ (Windows-friendly: avoid native builds where possible)
+
+fastapi==0.121.0
+uvicorn[standard]==0.38.0
+langgraph==1.1.9
+pydantic==2.12.3
+pydantic-ai-slim[google]==1.87.0
+google-genai==1.66.0
+letta-client==1.10.3
+supabase==2.29.0
+python-dotenv==1.1.1
+
+# Force a wheel-compatible NumPy on Python 3.13 to avoid source builds on Windows.
+numpy>=2.2.0; python_version >= "3.13"
