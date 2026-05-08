@@ -7,6 +7,8 @@ class KatalogState(TypedDict):
     Ahora con 'critic_feedback' e 'iterations' para soportar el bucle de calidad.
     """
     product_id: str
+    user_id: Optional[str]
+    auto_pilot_enabled: bool
     product_context: Optional[ProductContext]
     brand_rules: Optional[BrandRules]
     

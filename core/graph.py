@@ -1,9 +1,11 @@
 import os
+from typing import Any
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from langgraph.graph import StateGraph, END
 from core.state import KatalogState
 from core.schemas import ProductContext, BrandRules
+from core.shopify_tools import publish_to_shopify
 from agents.optimizer_agent import optimizer_agent
 from agents.critic_agent import critic_agent
 
@@ -14,6 +16,36 @@ supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(supabase_url, supabase_key)
 
+
+def _proposal_to_dict(proposal: Any) -> dict[str, Any]:
+    return proposal if isinstance(proposal, dict) else (proposal.model_dump() if hasattr(proposal, 'model_dump') else {})
+
+
+def _feedback_is_perfect(feedback: Any) -> bool:
+    if feedback is None:
+        return False
+    return feedback.get("is_perfect", False) if isinstance(feedback, dict) else getattr(feedback, "is_perfect", False)
+
+
+async def charge_profile_credit(user_id: str) -> bool:
+    try:
+        supabase.rpc("increment_profile_credits_used", {"p_user_id": user_id}).execute()
+        print(f"💳 [Créditos] Crédito consumido para usuario {user_id}.")
+        return True
+    except Exception as e:
+        print(f"❌ [Créditos] Error al cobrar crédito al usuario {user_id}: {e}")
+        return False
+
+
+async def mark_product_error(product_id: str, error_message: str) -> None:
+    try:
+        supabase.table('shopify_products').update({
+            'audit_status': 'ERROR',
+            'error_log': error_message
+        }).eq('id', product_id).execute()
+    except Exception as e:
+        print(f"❌ [Supabase] No se pudo registrar ERROR para producto {product_id}: {e}")
+
 # ==========================================
 # 🛑 NODO 1: EXTRACCIÓN DE DATOS
 # ==========================================
@@ -22,9 +54,11 @@ async def fetch_db_data(state: KatalogState):
     try:
         prod_res = supabase.table('shopify_products').select('*').eq('id', state['product_id']).single().execute()
         product_data = prod_res.data
+        if not product_data:
+            raise ValueError(f"Producto {state['product_id']} no encontrado")
         
         rules_res = supabase.table('brand_rules').select('*').eq('user_id', product_data['user_id']).single().execute()
-        rules_data = rules_res.data
+        rules_data = rules_res.data or {}
 
         context = ProductContext(
             shopify_id=product_data.get('shopify_id', ''),
@@ -42,7 +76,12 @@ async def fetch_db_data(state: KatalogState):
             brand_dna=rules_data.get('brand_dna', ''),
             formatting_rules=rules_data.get('formatting_rules', '')
         )
-        return {"product_context": context, "brand_rules": rules}
+        return {
+            "user_id": str(product_data['user_id']),
+            "auto_pilot_enabled": state.get("auto_pilot_enabled", False),
+            "product_context": context,
+            "brand_rules": rules
+        }
     except Exception as e:
         print(f"❌[Nodo 1] Error en DB: {e}")
         return {"error": str(e)}
@@ -189,20 +228,101 @@ async def save_to_supabase(state: KatalogState):
         return state
 
     try:
-        proposal_dict = proposal if isinstance(proposal, dict) else (proposal.model_dump() if hasattr(proposal, 'model_dump') else str(proposal))
+        proposal_dict = _proposal_to_dict(proposal)
         score = proposal_dict.get('audit_score', 80) if isinstance(proposal_dict, dict) else 80
+        audit_log_data = proposal_dict.get('audit_log', []) if isinstance(proposal_dict, dict) else []
         
         supabase.table('shopify_products').update({
             'ai_proposal': proposal_dict,
             'audit_score': score,
+            'audit_log': audit_log_data,
             'audit_status': 'NEEDS_REVIEW' 
         }).eq('id', state['product_id']).execute()
         
         print("✅ [Nodo 5] Producto actualizado exitosamente.")
+        if not state.get("auto_pilot_enabled", False):
+            user_id = state.get("user_id")
+            if user_id:
+                await charge_profile_credit(user_id)
+            else:
+                print("⚠️ [Créditos] No se cobró crédito: user_id ausente.")
         return {"status": "SUCCESS"}
     except Exception as e:
         print(f"❌[Nodo 5] Error al guardar: {e}")
         return {"error": str(e)}
+
+# ==========================================
+# 🚀 NODO 6: PUBLICAR EN SHOPIFY
+# ==========================================
+async def publish_node(state: KatalogState):
+    print("🚀 [Nodo 6] Auto-Pilot publicando en Shopify...")
+
+    product_id = str(state['product_id'])
+    proposal = state.get("final_proposal")
+    context = state.get("product_context")
+    user_id = state.get("user_id")
+
+    if state.get("error"):
+        print("⚠️ [Nodo 6] Estado con error previo. Saltando publicación.")
+        return state
+
+    if not proposal or not context or not user_id:
+        error_message = "Faltan datos para publicar en Shopify"
+        print(f"❌ [Nodo 6] {error_message}")
+        await mark_product_error(product_id, error_message)
+        return {"status": "ERROR", "error": error_message}
+
+    proposal_dict = _proposal_to_dict(proposal)
+    title = proposal_dict.get("new_title", "")
+    html = proposal_dict.get("new_body_html", "")
+
+    try:
+        integration_res = (
+            supabase.table('integrations')
+            .select('shop_url,access_token')
+            .eq('user_id', user_id)
+            .single()
+            .execute()
+        )
+        integration_data = integration_res.data or {}
+        if not integration_data:
+            raise ValueError(f"No hay integración Shopify para usuario {user_id}")
+
+        await publish_to_shopify(
+            shop_url=integration_data.get("shop_url", ""),
+            access_token=integration_data.get("access_token", ""),
+            product_shopify_id=context.shopify_id,
+            title=title,
+            html=html,
+        )
+
+        supabase.table('shopify_products').update({
+            'audit_status': 'OPTIMIZED',
+            'error_log': None
+        }).eq('id', product_id).execute()
+
+        await charge_profile_credit(user_id)
+        print(f"✅ [Nodo 6] Producto {product_id} publicado y marcado como OPTIMIZED.")
+        return {"status": "OPTIMIZED"}
+    except Exception as e:
+        error_message = str(e)
+        print(f"❌ [Nodo 6] Error publicando producto {product_id}: {error_message}")
+        await mark_product_error(product_id, error_message)
+        return {"status": "ERROR", "error": error_message}
+
+
+def should_publish_after_save(state: KatalogState):
+    if state.get("error"):
+        return "end"
+
+    if not state.get("auto_pilot_enabled", False):
+        return "end"
+
+    if not _feedback_is_perfect(state.get("critic_feedback")):
+        print("⚠️ [Publicación] Auto-Pilot no publica: el Juez no aprobó calidad perfecta.")
+        return "end"
+
+    return "publish"
 
 def build_graph():
     workflow = StateGraph(KatalogState)
@@ -212,6 +332,7 @@ def build_graph():
     workflow.add_node("ai_writer", audit_and_write_pydantic)
     workflow.add_node("critic", review_proposal)
     workflow.add_node("save_db", save_to_supabase)
+    workflow.add_node("publish_node", publish_node)
 
     workflow.set_entry_point("fetch_data")
     workflow.add_edge("fetch_data", "memory")
@@ -227,7 +348,15 @@ def build_graph():
         }
     )
     
-    workflow.add_edge("save_db", END)
+    workflow.add_conditional_edges(
+        "save_db",
+        should_publish_after_save,
+        {
+            "publish": "publish_node",
+            "end": END
+        }
+    )
+    workflow.add_edge("publish_node", END)
     return workflow.compile()
 
 katalog_agent = build_graph()
