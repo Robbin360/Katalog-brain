@@ -1,30 +1,90 @@
 import os
+from datetime import datetime
 from typing import Any
+
 from dotenv import load_dotenv
-from supabase import create_client, Client
-from langgraph.graph import StateGraph, END
+from langgraph.graph import END, StateGraph
+from supabase import Client, create_client
+
+from agents.critic_agent import run_critic
+from agents.optimizer_agent import run_optimizer
+from core.schemas import BrandRules, ProductContext
+from core.shopify_tools import publish_to_shopify as publish_product_to_shopify
 from core.state import KatalogState
-from core.schemas import ProductContext, BrandRules
-from core.shopify_tools import publish_to_shopify
-from agents.optimizer_agent import optimizer_agent
-from agents.critic_agent import critic_agent
 
 load_dotenv()
 
-# Inicializamos Supabase en Modo Dios (Service Role)
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(supabase_url, supabase_key)
 
+STATUS_PROCESSING = "PROCESSING"
+STATUS_NEEDS_OPTIMIZATION = "NEEDS_OPTIMIZATION"
+STATUS_READY_TO_PUBLISH = "READY_TO_PUBLISH"
+STATUS_OPTIMIZED = "OPTIMIZED"
+STATUS_ERROR = "ERROR"
+
 
 def _proposal_to_dict(proposal: Any) -> dict[str, Any]:
-    return proposal if isinstance(proposal, dict) else (proposal.model_dump() if hasattr(proposal, 'model_dump') else {})
+    if isinstance(proposal, dict):
+        return proposal
+    if hasattr(proposal, "model_dump"):
+        return proposal.model_dump()
+    return {}
 
 
 def _feedback_is_perfect(feedback: Any) -> bool:
     if feedback is None:
         return False
-    return feedback.get("is_perfect", False) if isinstance(feedback, dict) else getattr(feedback, "is_perfect", False)
+    if isinstance(feedback, dict):
+        return feedback.get("is_perfect", False)
+    return getattr(feedback, "is_perfect", False)
+
+
+def _feedback_issues(feedback: Any) -> list[str]:
+    if feedback is None:
+        return ["El Juez no devolvió feedback legible."]
+    if isinstance(feedback, dict):
+        return feedback.get("issues_found", ["Errores desconocidos"])
+    return getattr(feedback, "issues_found", ["Errores desconocidos"])
+
+
+def _optimization_metadata(
+    state: KatalogState,
+    proposal_dict: dict[str, Any],
+    html: str,
+) -> dict[str, Any]:
+    rules = state.get("brand_rules")
+    tone_from_rules = getattr(rules, "tone_voice", None) if rules else None
+
+    return {
+        "framework_used": (
+            state.get("framework_used")
+            or proposal_dict.get("framework_used")
+            or "Katalog CRO"
+        ),
+        "tone_used": (
+            state.get("tone_used")
+            or proposal_dict.get("tone_used")
+            or tone_from_rules
+            or "Professional"
+        ),
+        "description_length": (
+            state.get("description_length")
+            or proposal_dict.get("description_length")
+            or len(html)
+        ),
+    }
+
+
+async def mark_product_error(product_id: str, error_message: str) -> None:
+    try:
+        supabase.table("shopify_products").update({
+            "audit_status": STATUS_ERROR,
+            "error_log": error_message,
+        }).eq("id", product_id).execute()
+    except Exception as e:
+        print(f"❌ [Supabase] No se pudo registrar ERROR para producto {product_id}: {e}")
 
 
 async def charge_profile_credit(user_id: str) -> bool:
@@ -37,74 +97,119 @@ async def charge_profile_credit(user_id: str) -> bool:
         return False
 
 
-async def mark_product_error(product_id: str, error_message: str) -> None:
+# ==========================================
+# 🚦 NODO 0: MARCAR PROCESSING
+# ==========================================
+async def start_processing(state: KatalogState) -> dict[str, Any]:
+    product_id = str(state["product_id"])
+    print(f"🚦 [Nodo 0] Producto {product_id} entra en PROCESSING...")
+
     try:
-        supabase.table('shopify_products').update({
-            'audit_status': 'ERROR',
-            'error_log': error_message
-        }).eq('id', product_id).execute()
+        supabase.table("shopify_products").update({
+            "audit_status": STATUS_PROCESSING,
+            "error_log": None,
+        }).eq("id", product_id).execute()
+
+        return {
+            "auto_pilot_enabled": state.get("auto_pilot_enabled", False),
+            "error": None,
+        }
     except Exception as e:
-        print(f"❌ [Supabase] No se pudo registrar ERROR para producto {product_id}: {e}")
+        error_message = str(e)
+        print(f"❌ [Nodo 0] Error marcando PROCESSING: {error_message}")
+        return {"error": error_message}
+
 
 # ==========================================
 # 🛑 NODO 1: EXTRACCIÓN DE DATOS
 # ==========================================
-async def fetch_db_data(state: KatalogState):
-    print(f"🔍 [Nodo 1] Buscando producto ID: {state['product_id']}")
+async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
+    product_id = str(state["product_id"])
+    print(f"🔍 [Nodo 1] Buscando producto ID: {product_id}")
+
+    if state.get("error"):
+        return {}
+
     try:
-        prod_res = supabase.table('shopify_products').select('*').eq('id', state['product_id']).single().execute()
+        prod_res = (
+            supabase.table("shopify_products")
+            .select("*")
+            .eq("id", product_id)
+            .single()
+            .execute()
+        )
         product_data = prod_res.data
         if not product_data:
-            raise ValueError(f"Producto {state['product_id']} no encontrado")
-        
-        rules_res = supabase.table('brand_rules').select('*').eq('user_id', product_data['user_id']).single().execute()
+            raise ValueError(f"Producto {product_id} no encontrado")
+
+        rules_res = (
+            supabase.table("brand_rules")
+            .select("*")
+            .eq("user_id", product_data["user_id"])
+            .single()
+            .execute()
+        )
         rules_data = rules_res.data or {}
 
         context = ProductContext(
-            shopify_id=product_data.get('shopify_id', ''),
-            current_title=product_data.get('current_title', ''),
-            current_body_html=product_data.get('current_body_html', ''),
-            inventory_quantity=product_data.get('inventory_quantity', 0),
-            sales_last_7_days=product_data.get('sales_last_7_days', 0)
+            shopify_id=product_data.get("shopify_id", ""),
+            current_title=product_data.get("current_title", ""),
+            current_body_html=product_data.get("current_body_html", ""),
+            inventory_quantity=product_data.get("inventory_quantity", 0),
+            sales_last_7_days=product_data.get("sales_last_7_days", 0),
         )
-        
+
         rules = BrandRules(
-            tone_voice=rules_data.get('tone_voice', 'Professional'),
-            target_audience=rules_data.get('target_audience', 'General'),
-            language=rules_data.get('language', 'English'),
-            forbidden_words=rules_data.get('forbidden_words',[]),
-            brand_dna=rules_data.get('brand_dna', ''),
-            formatting_rules=rules_data.get('formatting_rules', '')
+            tone_voice=rules_data.get("tone_voice", "Professional"),
+            target_audience=rules_data.get("target_audience", "General"),
+            language=rules_data.get("language", "English"),
+            forbidden_words=rules_data.get("forbidden_words", []),
+            brand_dna=rules_data.get("brand_dna", ""),
+            formatting_rules=rules_data.get("formatting_rules", ""),
         )
+
         return {
-            "user_id": str(product_data['user_id']),
+            "user_id": str(product_data["user_id"]),
             "auto_pilot_enabled": state.get("auto_pilot_enabled", False),
             "product_context": context,
-            "brand_rules": rules
+            "brand_rules": rules,
         }
     except Exception as e:
-        print(f"❌[Nodo 1] Error en DB: {e}")
-        return {"error": str(e)}
+        error_message = str(e)
+        print(f"❌ [Nodo 1] Error en DB: {error_message}")
+        return {"error": error_message}
+
 
 # ==========================================
 # 🧠 NODO 2: RECUPERAR MEMORIA
 # ==========================================
-async def retrieve_memory_letta(state: KatalogState):
+async def retrieve_memory_letta(state: KatalogState) -> dict[str, Any]:
     print("🧠 [Nodo 2] Consultando memoria a largo plazo en Letta...")
-    return {"letta_memory": "Insight: Focus on benefits rather than just features."}
+
+    if state.get("error"):
+        return {}
+
+    try:
+        return {"letta_memory": "Insight: Focus on benefits rather than just features."}
+    except Exception as e:
+        error_message = str(e)
+        print(f"❌ [Nodo 2] Error recuperando memoria: {error_message}")
+        return {"error": error_message}
+
 
 # ==========================================
 # ✍️ NODO 3: LA IA ESCRIBE
 # ==========================================
-async def audit_and_write_pydantic(state: KatalogState):
+async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     iteration = state.get("iterations", 0)
-    print(f"✍️ [Nodo 3] Gemini Escribiendo (Intento {iteration + 1})...")
-    
-    if state.get("error"): return state 
-    
+    print(f"✍️ [Nodo 3] Gemini escribiendo (Intento {iteration + 1})...")
+
+    if state.get("error"):
+        return {}
+
     context = state["product_context"]
     rules = state["brand_rules"]
-    memory = state["letta_memory"]
+    memory = state.get("letta_memory", "")
     feedback = state.get("critic_feedback")
 
     prompt = f"""
@@ -113,6 +218,9 @@ async def audit_and_write_pydantic(state: KatalogState):
     - HTML: {context.current_body_html}
     - Inventory: {context.inventory_quantity}
     - Sales (7 days): {context.sales_last_7_days}
+
+    LONG-TERM MEMORY:
+    {memory}
 
     BRAND RULES:
     - Tone: {rules.tone_voice}
@@ -123,37 +231,36 @@ async def audit_and_write_pydantic(state: KatalogState):
     - Formats: {rules.formatting_rules}
     """
 
-    # Si hay crítica previa, la inyectamos para que corrija
     if feedback:
-        is_perf = feedback.get("is_perfect") if isinstance(feedback, dict) else getattr(feedback, "is_perfect", False)
-        issues = feedback.get("issues_found") if isinstance(feedback, dict) else getattr(feedback, "issues_found",[])
-        
+        is_perf = _feedback_is_perfect(feedback)
+        issues = _feedback_issues(feedback)
         if not is_perf:
             prompt += f"\n⚠️ URGENT CRITIQUE: Fix these issues immediately: {issues}"
 
     try:
-        result = await optimizer_agent.run(prompt)
-        final_data = getattr(result, 'data', getattr(result, 'output', result))
+        result = await run_optimizer(prompt)
+        final_data = getattr(result, "data", getattr(result, "output", result))
         return {"final_proposal": final_data}
     except Exception as e:
-        print(f"❌ [Nodo 3] Error de IA: {e}")
-        return {"error": str(e)}
+        error_message = str(e)
+        print(f"❌ [Nodo 3] Error de IA: {error_message}")
+        return {"error": error_message}
+
 
 # ==========================================
 # ⚖️ NODO 4: EL JUEZ
 # ==========================================
-async def review_proposal(state: KatalogState):
+async def review_proposal(state: KatalogState) -> dict[str, Any]:
     iteration = state.get("iterations", 0) + 1
-    print(f"⚖️ [Nodo 4] Juez Auditando propuesta (Intento {iteration})...")
-    
+    print(f"⚖️ [Nodo 4] Juez auditando propuesta (Intento {iteration})...")
+
     proposal = state.get("final_proposal")
-    if state.get("error") or not proposal: 
-        print("⚠️ [Nodo 4] No hay propuesta para evaluar.")
+    if state.get("error"):
         return {"iterations": iteration}
+    if not proposal:
+        return {"error": "No hay propuesta para evaluar.", "iterations": iteration}
 
-    context = state["product_context"]
     rules = state["brand_rules"]
-
     prompt = f"""
     BRAND RULES TO ENFORCE:
     - Tone: {rules.tone_voice}
@@ -163,124 +270,152 @@ async def review_proposal(state: KatalogState):
     AI PROPOSAL TO REVIEW:
     {proposal}
 
-    Verify if the proposal follows all rules strictly. 
+    Verify if the proposal follows all rules strictly.
     If it uses ANY forbidden words, reject it (is_perfect=False) and list them.
     If the title is over 70 chars, reject it.
     Provide actionable feedback for the writer to fix it.
     """
 
     try:
-        result = await critic_agent.run(prompt)
-        
-        # TELEMETRÍA DE INGENIERÍA
-        print(f"🔎[DEBUG JUEZ 1] Objeto devuelto: {type(result)}")
-        
-        # 🔥 EXTRACCIÓN BLINDADA (Buscamos donde sea que Pydantic esconda el dato)
-        feed_data = getattr(result, 'data', getattr(result, 'output', result))
-        
-        print(f"🔎 [DEBUG JUEZ 2] Datos validados: {feed_data}")
-        
+        result = await run_critic(prompt)
+        feed_data = getattr(result, "data", getattr(result, "output", result))
+        print(f"🔎 [Nodo 4] Veredicto del Juez: {feed_data}")
         return {"critic_feedback": feed_data, "iterations": iteration}
     except Exception as e:
-        print(f"❌ [Nodo 4] Error del Juez: {e}")
-        return {"error": str(e), "iterations": iteration}
+        error_message = str(e)
+        print(f"❌ [Nodo 4] Error del Juez: {error_message}")
+        return {"error": error_message, "iterations": iteration}
+
 
 # ==========================================
-# 🔀 ENRUTADOR (Lógica de Decisión Autónoma)
+# 🔀 ENRUTADOR DE CALIDAD
 # ==========================================
-def should_continue(state: KatalogState):
+def should_continue(state: KatalogState) -> str:
     if state.get("error"):
-        return "save_db"
-        
+        return "error_handler"
+
     feedback = state.get("critic_feedback")
     iterations = state.get("iterations", 0)
-    
+
     print(f"🚦 [Enrutador] Analizando veredicto del Juez (Intento {iterations})...")
-    
-    # Comprobación estricta de None
+
     if feedback is None:
-        print("⚠️[Decisión] El Juez no devolvió datos legibles. Guardando por seguridad...")
+        return "error_handler"
+
+    if _feedback_is_perfect(feedback):
+        print("🟢 [Decisión] Calidad aprobada. Pasando a READY_TO_PUBLISH.")
         return "save_db"
-        
-    # Extracción blindada (Soporta Dicts y Objetos Pydantic)
-    is_perf = getattr(feedback, "is_perfect", False) if not isinstance(feedback, dict) else feedback.get("is_perfect", False)
-    issues = getattr(feedback, "issues_found",["Errores desconocidos"]) if not isinstance(feedback, dict) else feedback.get("issues_found",["Errores desconocidos"])
-    
-    if is_perf:
-        print("🟢 [Decisión] Calidad PERFECTA. Aprobado por el Juez.")
-        return "save_db"
-    elif iterations >= 3:
-        print(f"🟠 [Decisión] Límite de 3 intentos alcanzado. Guardando mejor esfuerzo...")
-        return "save_db"
-    else:
-        print(f"🔴[Decisión] Errores detectados: {issues}. Devolviendo al Escritor...")
-        return "ai_writer"
+
+    issues = _feedback_issues(feedback)
+    if iterations >= 3:
+        print(f"🟠 [Decisión] Límite alcanzado. Marcando NEEDS_OPTIMIZATION: {issues}")
+        return "needs_optimization"
+
+    print(f"🔴 [Decisión] Errores detectados: {issues}. Devolviendo al Escritor...")
+    return "ai_writer"
+
 
 # ==========================================
-# 💾 NODO 5: GUARDAR EN BASE DE DATOS
+# 💾 NODO 5: GUARDAR READY_TO_PUBLISH
 # ==========================================
-async def save_to_supabase(state: KatalogState):
-    print("💾 [Nodo 5] Guardando resultados en Supabase...")
+async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
+    print("💾 [Nodo 5] Guardando propuesta aprobada en Supabase...")
     proposal = state.get("final_proposal")
-    
-    if state.get("error") or not proposal: 
-        print("⚠️ [Nodo 5] Nada que guardar.")
-        return state
+
+    if state.get("error"):
+        return {}
+    if not proposal:
+        return {"error": "No hay propuesta aprobada para guardar."}
 
     try:
         proposal_dict = _proposal_to_dict(proposal)
-        score = proposal_dict.get('audit_score', 80) if isinstance(proposal_dict, dict) else 80
-        audit_log_data = proposal_dict.get('audit_log', []) if isinstance(proposal_dict, dict) else []
-        
-        supabase.table('shopify_products').update({
-            'ai_proposal': proposal_dict,
-            'audit_score': score,
-            'audit_log': audit_log_data,
-            'audit_status': 'NEEDS_REVIEW' 
-        }).eq('id', state['product_id']).execute()
-        
-        print("✅ [Nodo 5] Producto actualizado exitosamente.")
+        score = proposal_dict.get("audit_score", 80)
+        audit_log_data = proposal_dict.get("audit_log", [])
+
+        supabase.table("shopify_products").update({
+            "ai_proposal": proposal_dict,
+            "audit_score": score,
+            "audit_log": audit_log_data,
+            "audit_status": STATUS_READY_TO_PUBLISH,
+            "error_log": None,
+        }).eq("id", state["product_id"]).execute()
+
+        print("✅ [Nodo 5] Producto marcado como READY_TO_PUBLISH.")
         if not state.get("auto_pilot_enabled", False):
             user_id = state.get("user_id")
             if user_id:
                 await charge_profile_credit(user_id)
             else:
                 print("⚠️ [Créditos] No se cobró crédito: user_id ausente.")
-        return {"status": "SUCCESS"}
+
+        return {"status": STATUS_READY_TO_PUBLISH}
     except Exception as e:
-        print(f"❌[Nodo 5] Error al guardar: {e}")
-        return {"error": str(e)}
+        error_message = str(e)
+        print(f"❌ [Nodo 5] Error guardando propuesta: {error_message}")
+        return {"error": error_message}
+
+
+# ==========================================
+# 🟠 NODO 5B: NECESITA OPTIMIZACIÓN
+# ==========================================
+async def mark_needs_optimization(state: KatalogState) -> dict[str, Any]:
+    product_id = str(state["product_id"])
+    feedback = state.get("critic_feedback")
+    proposal = state.get("final_proposal")
+    issues = _feedback_issues(feedback)
+    error_log = "; ".join(issues)
+
+    try:
+        update_data: dict[str, Any] = {
+            "audit_status": STATUS_NEEDS_OPTIMIZATION,
+            "error_log": error_log,
+        }
+
+        if proposal:
+            proposal_dict = _proposal_to_dict(proposal)
+            update_data["ai_proposal"] = proposal_dict
+            update_data["audit_score"] = proposal_dict.get("audit_score", 0)
+            update_data["audit_log"] = proposal_dict.get("audit_log", [])
+
+        supabase.table("shopify_products").update(update_data).eq("id", product_id).execute()
+        print(f"🟠 [Nodo 5B] Producto {product_id} marcado como NEEDS_OPTIMIZATION.")
+        return {"status": STATUS_NEEDS_OPTIMIZATION}
+    except Exception as e:
+        error_message = str(e)
+        print(f"❌ [Nodo 5B] Error marcando NEEDS_OPTIMIZATION: {error_message}")
+        return {"error": error_message}
+
 
 # ==========================================
 # 🚀 NODO 6: PUBLICAR EN SHOPIFY
 # ==========================================
-async def publish_node(state: KatalogState):
+async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
     print("🚀 [Nodo 6] Auto-Pilot publicando en Shopify...")
 
-    product_id = str(state['product_id'])
+    product_id = str(state["product_id"])
     proposal = state.get("final_proposal")
     context = state.get("product_context")
     user_id = state.get("user_id")
 
     if state.get("error"):
-        print("⚠️ [Nodo 6] Estado con error previo. Saltando publicación.")
-        return state
-
+        return {}
     if not proposal or not context or not user_id:
-        error_message = "Faltan datos para publicar en Shopify"
-        print(f"❌ [Nodo 6] {error_message}")
-        await mark_product_error(product_id, error_message)
-        return {"status": "ERROR", "error": error_message}
+        return {"error": "Faltan datos para publicar en Shopify."}
 
     proposal_dict = _proposal_to_dict(proposal)
     title = proposal_dict.get("new_title", "")
     html = proposal_dict.get("new_body_html", "")
+    metadata = _optimization_metadata(state, proposal_dict, html)
+
+    if not title or not html:
+        return {"error": "La propuesta aprobada no contiene título o descripción HTML."}
 
     try:
         integration_res = (
-            supabase.table('integrations')
-            .select('shop_url,access_token')
-            .eq('user_id', user_id)
+            supabase.table("integrations")
+            .select("shop_url,access_token")
+            .eq("user_id", user_id)
+            .eq("provider", "shopify")
             .single()
             .execute()
         )
@@ -288,7 +423,7 @@ async def publish_node(state: KatalogState):
         if not integration_data:
             raise ValueError(f"No hay integración Shopify para usuario {user_id}")
 
-        await publish_to_shopify(
+        await publish_product_to_shopify(
             shop_url=integration_data.get("shop_url", ""),
             access_token=integration_data.get("access_token", ""),
             product_shopify_id=context.shopify_id,
@@ -296,67 +431,144 @@ async def publish_node(state: KatalogState):
             html=html,
         )
 
-        supabase.table('shopify_products').update({
-            'audit_status': 'OPTIMIZED',
-            'error_log': None
-        }).eq('id', product_id).execute()
+        published_at = datetime.now().isoformat()
+        supabase.table("shopify_products").update({
+            "audit_status": STATUS_OPTIMIZED,
+            "current_title": title,
+            "current_body_html": html,
+            "last_audit_at": published_at,
+            "error_log": None,
+        }).eq("id", product_id).execute()
+
+        supabase.table("optimizations").insert({
+            "user_id": user_id,
+            "product_id": product_id,
+            "title_generated": title,
+            "description_generated": html,
+            "title_previous": context.current_title,
+            "description_previous": context.current_body_html,
+            "framework_used": metadata["framework_used"],
+            "tone_used": metadata["tone_used"],
+            "description_length": metadata["description_length"],
+            "status": "published",
+        }).execute()
 
         await charge_profile_credit(user_id)
         print(f"✅ [Nodo 6] Producto {product_id} publicado y marcado como OPTIMIZED.")
-        return {"status": "OPTIMIZED"}
+        return {"status": STATUS_OPTIMIZED}
     except Exception as e:
         error_message = str(e)
         print(f"❌ [Nodo 6] Error publicando producto {product_id}: {error_message}")
-        await mark_product_error(product_id, error_message)
-        return {"status": "ERROR", "error": error_message}
+        return {"error": error_message}
 
 
-def should_publish_after_save(state: KatalogState):
+# ==========================================
+# 🧯 NODO GLOBAL DE ERROR
+# ==========================================
+async def error_handler(state: KatalogState) -> dict[str, Any]:
+    product_id = str(state["product_id"])
+    fallback_message = (
+        "El Juez no devolvió feedback legible."
+        if state.get("critic_feedback") is None
+        else "Error desconocido en LangGraph."
+    )
+    error_message = str(state.get("error") or fallback_message)
+    print(f"🧯 [Error Handler] Marcando producto {product_id} como ERROR: {error_message}")
+    await mark_product_error(product_id, error_message)
+    return {"status": STATUS_ERROR}
+
+
+def route_after_start(state: KatalogState) -> str:
+    return "error_handler" if state.get("error") else "fetch_data"
+
+
+def route_after_fetch(state: KatalogState) -> str:
+    return "error_handler" if state.get("error") else "memory"
+
+
+def route_after_memory(state: KatalogState) -> str:
+    return "error_handler" if state.get("error") else "ai_writer"
+
+
+def route_after_save(state: KatalogState) -> str:
     if state.get("error"):
-        return "end"
+        return "error_handler"
+    if state.get("auto_pilot_enabled", False):
+        return "publish_to_shopify"
+    return "end"
 
-    if not state.get("auto_pilot_enabled", False):
-        return "end"
 
-    if not _feedback_is_perfect(state.get("critic_feedback")):
-        print("⚠️ [Publicación] Auto-Pilot no publica: el Juez no aprobó calidad perfecta.")
-        return "end"
+def route_after_publish(state: KatalogState) -> str:
+    return "error_handler" if state.get("error") else "end"
 
-    return "publish"
+
+def route_after_needs_optimization(state: KatalogState) -> str:
+    return "error_handler" if state.get("error") else "end"
+
 
 def build_graph():
     workflow = StateGraph(KatalogState)
 
+    workflow.add_node("start_processing", start_processing)
     workflow.add_node("fetch_data", fetch_db_data)
     workflow.add_node("memory", retrieve_memory_letta)
     workflow.add_node("ai_writer", audit_and_write_pydantic)
     workflow.add_node("critic", review_proposal)
     workflow.add_node("save_db", save_to_supabase)
-    workflow.add_node("publish_node", publish_node)
+    workflow.add_node("needs_optimization", mark_needs_optimization)
+    workflow.add_node("publish_to_shopify", publish_to_shopify_node)
+    workflow.add_node("error_handler", error_handler)
 
-    workflow.set_entry_point("fetch_data")
-    workflow.add_edge("fetch_data", "memory")
-    workflow.add_edge("memory", "ai_writer")
-    workflow.add_edge("ai_writer", "critic") 
+    workflow.set_entry_point("start_processing")
 
+    workflow.add_conditional_edges(
+        "start_processing",
+        route_after_start,
+        {"fetch_data": "fetch_data", "error_handler": "error_handler"},
+    )
+    workflow.add_conditional_edges(
+        "fetch_data",
+        route_after_fetch,
+        {"memory": "memory", "error_handler": "error_handler"},
+    )
+    workflow.add_conditional_edges(
+        "memory",
+        route_after_memory,
+        {"ai_writer": "ai_writer", "error_handler": "error_handler"},
+    )
+    workflow.add_edge("ai_writer", "critic")
     workflow.add_conditional_edges(
         "critic",
         should_continue,
         {
             "save_db": "save_db",
-            "ai_writer": "ai_writer"
-        }
+            "ai_writer": "ai_writer",
+            "needs_optimization": "needs_optimization",
+            "error_handler": "error_handler",
+        },
     )
-    
     workflow.add_conditional_edges(
         "save_db",
-        should_publish_after_save,
+        route_after_save,
         {
-            "publish": "publish_node",
-            "end": END
-        }
+            "publish_to_shopify": "publish_to_shopify",
+            "error_handler": "error_handler",
+            "end": END,
+        },
     )
-    workflow.add_edge("publish_node", END)
+    workflow.add_conditional_edges(
+        "publish_to_shopify",
+        route_after_publish,
+        {"error_handler": "error_handler", "end": END},
+    )
+    workflow.add_conditional_edges(
+        "needs_optimization",
+        route_after_needs_optimization,
+        {"error_handler": "error_handler", "end": END},
+    )
+    workflow.add_edge("error_handler", END)
+
     return workflow.compile()
+
 
 katalog_agent = build_graph()
