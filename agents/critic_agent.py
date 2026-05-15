@@ -6,26 +6,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-FALLBACK_ERROR_HINTS = (
-    "429",
-    "quota",
-    "rate limit",
-    "resource exhausted",
-    "modelhttperror",
-    "status_code",
-    "google",
-    "genai",
-    "overloaded",
-    "temporarily unavailable",
-    "service unavailable",
-)
-
-
-def _should_use_fallback(error: Exception) -> bool:
-    error_text = f"{type(error).__name__}: {error}".lower()
-    return any(hint in error_text for hint in FALLBACK_ERROR_HINTS)
-
-
 primary_critic = Agent(
     model='google-gla:gemini-3-flash-preview', 
     output_type=CriticFeedback,
@@ -38,7 +18,7 @@ primary_critic = Agent(
 )
 
 fallback_critic = Agent(
-    model='google-gla:gemini-1.5-flash',
+    model='groq:llama-3.1-8b-instant',
     output_type=CriticFeedback,
     system_prompt=(
         "You are a strict QA checker for Shopify product copy. "
@@ -52,15 +32,12 @@ fallback_critic = Agent(
 critic_agent = primary_critic
 
 
-async def run_critic(prompt: str) -> Any:
+async def run_critic_with_fallback(prompt: str) -> Any:
     try:
         return await primary_critic.run(prompt)
-    except Exception as error:
-        if not _should_use_fallback(error):
-            raise
-
+    except Exception as e:
         print(
-            "⚠️ [Fallback] El Primary Critic falló por Cuota. "
-            "Despertando al Fallback Agent (Flash)..."
+            "⚠️ [Fallback] Error en Google API (Quota/Timeout). "
+            "Activando motor Groq Llama 3..."
         )
         return await fallback_critic.run(prompt)

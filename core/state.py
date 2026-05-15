@@ -15,6 +15,9 @@ class KatalogState(TypedDict, total=False):
     # Memoria y Propuestas
     letta_memory: NotRequired[str]
     final_proposal: NotRequired[AIProposalOutput]
+
+    # RAG - Knowledge Base Retrieval
+    rag_knowledge: NotRequired[list[dict[str, Any]]]
     
     # 🛡️ CAPAS DE SEGURIDAD Y BUCLE DE CRÍTICA
     critic_feedback: NotRequired[CriticFeedback | Any] # Aquí vive el veredicto del Juez

@@ -3,11 +3,13 @@ from datetime import datetime
 from typing import Any
 
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 from langgraph.graph import END, StateGraph
 from supabase import Client, create_client
 
-from agents.critic_agent import run_critic
-from agents.optimizer_agent import run_optimizer
+from agents.critic_agent import run_critic_with_fallback
+from agents.optimizer_agent import run_optimizer_with_fallback
 from core.schemas import BrandRules, ProductContext
 from core.shopify_tools import publish_to_shopify as publish_product_to_shopify
 from core.state import KatalogState
@@ -17,6 +19,7 @@ load_dotenv()
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(supabase_url, supabase_key)
+genai_client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
 
 STATUS_PROCESSING = "PROCESSING"
 STATUS_NEEDS_OPTIMIZATION = "NEEDS_OPTIMIZATION"
@@ -198,6 +201,46 @@ async def retrieve_memory_letta(state: KatalogState) -> dict[str, Any]:
 
 
 # ==========================================
+# 📚 NODO 2B: CONSULTAR RAG GLOBAL
+# ==========================================
+async def retrieve_knowledge(state: KatalogState) -> dict[str, Any]:
+    print("📚 [Nodo 2B] Consultando Knowledge Base para consejos expertos...")
+
+    if state.get("error"):
+        return {}
+
+    context = state.get("product_context")
+    if not context:
+        return {"error": "No hay contexto de producto para consultar."}
+
+    title = context.current_title
+    if not title:
+        print("⚠️ [Nodo 2B] Producto sin título. Saltando RAG.")
+        return {"rag_knowledge": []}
+
+    try:
+        result = genai_client.models.embed_content(
+            model='models/gemini-embedding-2',
+            contents=title,
+            config=types.EmbedContentConfig(output_dimensionality=1536)
+        )
+        vector = result.embeddings[0].values
+
+        rpc_res = supabase.rpc("match_knowledge", {
+            "query_embedding": vector,
+            "match_threshold": 0.5,
+            "match_count": 3,
+        }).execute()
+
+        matches = rpc_res.data or []
+        print(f"📚 [Nodo 2B] {len(matches)} consejos recuperados de la Knowledge Base.")
+        return {"rag_knowledge": matches}
+    except Exception as e:
+        print(f"⚠️ [Nodo 2B] Error consultando RAG: {e}")
+        return {"rag_knowledge": []}
+
+
+# ==========================================
 # ✍️ NODO 3: LA IA ESCRIBE
 # ==========================================
 async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
@@ -211,6 +254,7 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     rules = state["brand_rules"]
     memory = state.get("letta_memory", "")
     feedback = state.get("critic_feedback")
+    rag = state.get("rag_knowledge", [])
 
     prompt = f"""
     PRODUCT TO OPTIMIZE:
@@ -231,6 +275,16 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     - Formats: {rules.formatting_rules}
     """
 
+    if rag:
+        rag_text = "\n".join(
+            f"- {r.get('content', r) if isinstance(r, dict) else r}"
+            for r in rag
+        )
+        prompt += f"""
+    CONSEJOS EXPERTOS DE VENTAS (aplicalos estrictamente):
+    {rag_text}
+    """
+
     if feedback:
         is_perf = _feedback_is_perfect(feedback)
         issues = _feedback_issues(feedback)
@@ -238,7 +292,7 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
             prompt += f"\n⚠️ URGENT CRITIQUE: Fix these issues immediately: {issues}"
 
     try:
-        result = await run_optimizer(prompt)
+        result = await run_optimizer_with_fallback(prompt)
         final_data = getattr(result, "data", getattr(result, "output", result))
         return {"final_proposal": final_data}
     except Exception as e:
@@ -277,7 +331,7 @@ async def review_proposal(state: KatalogState) -> dict[str, Any]:
     """
 
     try:
-        result = await run_critic(prompt)
+        result = await run_critic_with_fallback(prompt)
         feed_data = getattr(result, "data", getattr(result, "output", result))
         print(f"🔎 [Nodo 4] Veredicto del Juez: {feed_data}")
         return {"critic_feedback": feed_data, "iterations": iteration}
@@ -487,6 +541,10 @@ def route_after_fetch(state: KatalogState) -> str:
 
 
 def route_after_memory(state: KatalogState) -> str:
+    return "error_handler" if state.get("error") else "retrieve_knowledge"
+
+
+def route_after_knowledge(state: KatalogState) -> str:
     return "error_handler" if state.get("error") else "ai_writer"
 
 
@@ -512,6 +570,7 @@ def build_graph():
     workflow.add_node("start_processing", start_processing)
     workflow.add_node("fetch_data", fetch_db_data)
     workflow.add_node("memory", retrieve_memory_letta)
+    workflow.add_node("retrieve_knowledge", retrieve_knowledge)
     workflow.add_node("ai_writer", audit_and_write_pydantic)
     workflow.add_node("critic", review_proposal)
     workflow.add_node("save_db", save_to_supabase)
@@ -534,6 +593,11 @@ def build_graph():
     workflow.add_conditional_edges(
         "memory",
         route_after_memory,
+        {"retrieve_knowledge": "retrieve_knowledge", "error_handler": "error_handler"},
+    )
+    workflow.add_conditional_edges(
+        "retrieve_knowledge",
+        route_after_knowledge,
         {"ai_writer": "ai_writer", "error_handler": "error_handler"},
     )
     workflow.add_edge("ai_writer", "critic")

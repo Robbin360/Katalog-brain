@@ -6,26 +6,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-FALLBACK_ERROR_HINTS = (
-    "429",
-    "quota",
-    "rate limit",
-    "resource exhausted",
-    "modelhttperror",
-    "status_code",
-    "google",
-    "genai",
-    "overloaded",
-    "temporarily unavailable",
-    "service unavailable",
-)
-
-
-def _should_use_fallback(error: Exception) -> bool:
-    error_text = f"{type(error).__name__}: {error}".lower()
-    return any(hint in error_text for hint in FALLBACK_ERROR_HINTS)
-
-
 primary_optimizer = Agent(
     model='google-gla:gemini-3.1-pro-preview',
     output_type=AIProposalOutput,
@@ -39,7 +19,7 @@ primary_optimizer = Agent(
 )
 
 fallback_optimizer = Agent(
-    model='google-gla:gemini-3-flash-preview',
+    model='groq:llama-3.3-70b-versatile',
     output_type=AIProposalOutput,
     system_prompt=(
         "You are a strict Shopify product copy optimizer. "
@@ -54,15 +34,12 @@ fallback_optimizer = Agent(
 optimizer_agent = primary_optimizer
 
 
-async def run_optimizer(prompt: str) -> Any:
+async def run_optimizer_with_fallback(prompt: str) -> Any:
     try:
         return await primary_optimizer.run(prompt)
-    except Exception as error:
-        if not _should_use_fallback(error):
-            raise
-
+    except Exception as e:
         print(
-            "⚠️ [Fallback] El Primary Optimizer (Pro) falló por Cuota. "
-            "Despertando al Fallback Agent (Flash)..."
+            "⚠️ [Fallback] Error en Google API (Quota/Timeout). "
+            "Activando motor Groq Llama 3..."
         )
         return await fallback_optimizer.run(prompt)

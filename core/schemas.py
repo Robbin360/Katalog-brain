@@ -39,3 +39,14 @@ class CriticFeedback(BaseModel):
     is_perfect: bool = Field(..., description="True ONLY if the copy meets absolutely ALL SEO and Brand rules. False if there is even one minor error.")
     issues_found: List[str] = Field(..., description="List of specific violations found (e.g. 'Used forbidden word: plastic', 'Title is 85 chars, needs to be under 70').")
     suggestions: str = Field(..., description="Surgical instructions for the writer agent to fix the copy in the next iteration.")
+
+# ==========================================
+# 5. RAG Knowledge Base - Ingestion Schemas
+# ==========================================
+class KnowledgeChunk(BaseModel):
+    content: str = Field(..., description="Una regla de oro o concepto accionable destilado del texto.")
+    category: str = Field(..., description="Categoría (ej. 'SEO', 'Copywriting', 'Pricing', 'Psychology').")
+    tags: List[str] = Field(..., description="Lista de palabras clave.")
+
+class IngestionResult(BaseModel):
+    chunks: List[KnowledgeChunk]
