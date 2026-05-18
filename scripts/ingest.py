@@ -40,7 +40,10 @@ def save_to_knowledge_base(chunk: KnowledgeChunk, embedding: List[float]) -> boo
             "embedding": embedding,
             "metadata": {
                 "category": chunk.category,
-                "tags": chunk.tags
+                "tags": chunk.tags,
+                "source": chunk.source,
+                "ecommerce_applicability": chunk.ecommerce_applicability,
+                "engine": "gemini-embedding-2"
             }
         }).execute()
         
@@ -75,7 +78,8 @@ def process_text(text: str):
         print("\n[" + str(i) + "/" + str(len(chunks)) + "] Processing chunk...")
         print("   Category: " + repr(chunk.category))
         print("   Tags: " + repr(', '.join(chunk.tags)))
-        # print("   Content: " + chunk.content[:100] + "...")  # Temporarily disabled
+        print("   Source: " + repr(chunk.source))
+        print("   Applicability: " + repr(chunk.ecommerce_applicability))
         
         try:
             # Generate embedding
@@ -103,24 +107,17 @@ def main():
     """Main execution function with test data."""
     # Test text about sales psychology
     test_text = """
-    La urgencia y la escasez son principios fundamentales de la psicología de ventas. 
-    Cuando un cliente percibe que una oferta está limitada en tiempo o cantidad, 
-    su cerebro activa mecanismos de pérdida aversión, aumentando significativamente 
-    la probabilidad de compra. Los contadores regresivos, las etiquetas de 
-    "últimas unidades" y las ofertas por tiempo limitado son tácticas probadas 
-    que capitalizan este sesgo cognitivo. Sin embargo, es crucial usar estas 
-    técnicas éticamente y con genuina limitación para mantener la confianza del cliente.
-    
-    El principio de reciprocidad dicta que cuando recibimos algo de valor, 
-    sentimos una obligación psicológica de corresponder. En e-commerce, esto 
-    se traduce en ofrecer contenido gratuito, muestras, o consultas iniciales 
-    antes de pedir una venta. Los clientes que reciben valor primero son 
-    significativamente más propensos a comprar.
-    
-    La prueba social es otro poderoso factor de influencia. Mostrar testimonios, 
-    reseñas de clientes, números de ventas y casos de éxito activa el deseo 
-    de conformidad social. Los compradores miran el comportamiento de otros 
-    para validar sus decisiones, especialmente en productos de mayor valor.
+    Contexto 2026: Títulos para la Era de IA
+Este bloque es crítico para Katalog AI dado el panorama actual:
+El problema:
+Los AI Overviews reducen clics un 58% (Ahrefs, febrero 2026). El 60% de las búsquedas termina sin clic. Solo el 1% de las búsquedas llevan a que el usuario haga clic en un enlace dentro del AI Overview. Position Digital
+La oportunidad:
+Cuando tu marca es citada dentro del AI Overview, el CTR orgánico es 35% más alto. Los AI Overviews aparecen en el 99.9% de keywords informacionales, pero solo en el 3.2% de búsquedas de Shopping — el canal de e-commerce está relativamente protegido. Position Digital
+Implicación para títulos en 2026:
+
+Shopping está protegido. Los títulos de producto en Google Shopping tienen menor interferencia de IA que el contenido informacional.
+Títulos para ser citados. Un título debe ser lo suficientemente claro y específico para que un LLM lo cite como fuente autoritativa.
+Intención transaccional primero. Los sectores con menor presencia de AI Overviews son Shopping (3.2%) y Real Estate (5.8%) — el e-commerce mantiene CTR orgánico alto. 
     """
     
     process_text(test_text)

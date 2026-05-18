@@ -6,6 +6,9 @@ from core.graph import katalog_agent, supabase
 
 PATROL_INTERVAL_SECONDS: int = 30
 MAX_PRODUCTS_PER_PATROL: int = 3
+STATUS_PENDING_AUDIT: str = "PENDING_AUDIT"
+STATUS_PROCESSING: str = "PROCESSING"
+STATUS_OUT_OF_CREDITS: str = "OUT_OF_CREDITS"
 
 
 def _to_int(value: Any) -> int:
@@ -13,6 +16,32 @@ def _to_int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+async def _run_sync(callable_obj):
+    return await asyncio.to_thread(callable_obj)
+
+
+async def _claim_pending_products(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected_ids = [product["id"] for product in products if product.get("id")]
+    if not selected_ids:
+        return []
+
+    claim_res = await _run_sync(
+        lambda: supabase.table("shopify_products")
+        .update({"audit_status": STATUS_PROCESSING})
+        .in_("id", selected_ids)
+        .eq("audit_status", STATUS_PENDING_AUDIT)
+        .select("id")
+        .execute()
+    )
+    claimed_ids = {str(product.get("id")) for product in (claim_res.data or [])}
+
+    if not claimed_ids:
+        print("⚠️ [Auto-Pilot] Ningún producto fue reservado. Otro worker pudo tomar el lote.")
+        return []
+
+    return [product for product in products if str(product.get("id")) in claimed_ids]
 
 
 async def auto_pilot_patrol() -> None:
@@ -26,8 +55,8 @@ async def auto_pilot_patrol() -> None:
         try:
             print("⏳ [Auto-Pilot] Buscando usuarios con Auto-Pilot activo...")
 
-            profiles_res = (
-                supabase.table("profiles")
+            profiles_res = await _run_sync(
+                lambda: supabase.table("profiles")
                 .select("id,auto_pilot_enabled,credits_used,credits_total")
                 .eq("auto_pilot_enabled", True)
                 .execute()
@@ -51,17 +80,17 @@ async def auto_pilot_patrol() -> None:
 
                     if credits_remaining <= 0:
                         print(f"🛑 [Auto-Pilot] Usuario {user_id} sin créditos. Marcando pendientes.")
-                        supabase.table("shopify_products").update({
-                            "audit_status": "OUT_OF_CREDITS"
-                        }).eq("user_id", user_id).eq("audit_status", "PENDING_AUDIT").execute()
+                        await _run_sync(lambda: supabase.table("shopify_products").update({
+                            "audit_status": STATUS_OUT_OF_CREDITS
+                        }).eq("user_id", user_id).eq("audit_status", STATUS_PENDING_AUDIT).execute())
                         continue
 
                     batch_limit = min(MAX_PRODUCTS_PER_PATROL, credits_remaining)
-                    products_res = (
-                        supabase.table("shopify_products")
+                    products_res = await _run_sync(
+                        lambda: supabase.table("shopify_products")
                         .select("id,user_id,current_title,audit_status")
                         .eq("user_id", user_id)
-                        .eq("audit_status", "PENDING_AUDIT")
+                        .eq("audit_status", STATUS_PENDING_AUDIT)
                         .limit(batch_limit)
                         .execute()
                     )
@@ -70,13 +99,17 @@ async def auto_pilot_patrol() -> None:
                     if not products:
                         print(f"✅ [Auto-Pilot] Usuario {user_id} sin productos pendientes.")
                     else:
+                        claimed_products = await _claim_pending_products(products)
+                        if not claimed_products:
+                            continue
+
                         print(
                             "🤖 [Auto-Pilot] "
-                            f"Usuario {user_id}: {len(products)} productos en lote "
+                            f"Usuario {user_id}: {len(claimed_products)} productos reservados "
                             f"({credits_remaining} créditos disponibles)."
                         )
 
-                        for product in products:
+                        for product in claimed_products:
                             product_id = str(product.get("id", ""))
                             if not product_id:
                                 print("⚠️ [Auto-Pilot] Producto sin ID. Saltando registro.")

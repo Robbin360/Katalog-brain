@@ -53,6 +53,10 @@ supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(supabase_url, supabase_key)
 
+
+async def run_sync_io(callable_obj):
+    return await asyncio.to_thread(callable_obj)
+
 # --- MODELOS DE DATOS ---
 class OptimizeRequest(BaseModel):
     product_id: Union[str, int] = Field(
@@ -70,7 +74,13 @@ async def process_triage_queue():
     
     try:
         # 1. Buscar hasta 10 productos que no han sido auditados
-        res = supabase.table('shopify_products').select('id, current_title, current_body_html').eq('audit_status', 'PENDING_AUDIT').limit(10).execute()
+        res = await run_sync_io(
+            lambda: supabase.table('shopify_products')
+            .select('id, current_title, current_body_html')
+            .eq('audit_status', 'PENDING_AUDIT')
+            .limit(10)
+            .execute()
+        )
         products = res.data
         
         if not products:
@@ -91,12 +101,12 @@ async def process_triage_queue():
             audit_data = getattr(result, 'data', getattr(result, 'output', result))
             
             # 3. Guardar el veredicto en Supabase al instante
-            supabase.table('shopify_products').update({
+            await run_sync_io(lambda: supabase.table('shopify_products').update({
                 'seo_score_initial': audit_data.score,
                 'audit_score': audit_data.score,
                 'error_log': audit_data.reason, 
-                'audit_status': 'NEEDS_REVIEW' if audit_data.score < 90 else 'OPTIMIZED'
-            }).eq('id', prod['id']).execute()
+                'audit_status': 'NEEDS_OPTIMIZATION' if audit_data.score < 90 else 'READY_TO_PUBLISH'
+            }).eq('id', prod['id']).execute())
             
             print(f"✅ Score: {audit_data.score}/100 | Motivo: {audit_data.reason}")
             

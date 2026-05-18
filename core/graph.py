@@ -1,3 +1,4 @@
+import asyncio
 import os
 from datetime import datetime
 from typing import Any
@@ -26,6 +27,10 @@ STATUS_NEEDS_OPTIMIZATION = "NEEDS_OPTIMIZATION"
 STATUS_READY_TO_PUBLISH = "READY_TO_PUBLISH"
 STATUS_OPTIMIZED = "OPTIMIZED"
 STATUS_ERROR = "ERROR"
+
+
+async def _run_sync(callable_obj):
+    return await asyncio.to_thread(callable_obj)
 
 
 def _proposal_to_dict(proposal: Any) -> dict[str, Any]:
@@ -82,17 +87,22 @@ def _optimization_metadata(
 
 async def mark_product_error(product_id: str, error_message: str) -> None:
     try:
-        supabase.table("shopify_products").update({
+        await _run_sync(lambda: supabase.table("shopify_products").update({
             "audit_status": STATUS_ERROR,
             "error_log": error_message,
-        }).eq("id", product_id).execute()
+        }).eq("id", product_id).execute())
     except Exception as e:
         print(f"❌ [Supabase] No se pudo registrar ERROR para producto {product_id}: {e}")
 
 
 async def charge_profile_credit(user_id: str) -> bool:
     try:
-        supabase.rpc("increment_profile_credits_used", {"p_user_id": user_id}).execute()
+        await _run_sync(
+            lambda: supabase.rpc(
+                "increment_profile_credits_used",
+                {"p_user_id": user_id},
+            ).execute()
+        )
         print(f"💳 [Créditos] Crédito consumido para usuario {user_id}.")
         return True
     except Exception as e:
@@ -108,10 +118,10 @@ async def start_processing(state: KatalogState) -> dict[str, Any]:
     print(f"🚦 [Nodo 0] Producto {product_id} entra en PROCESSING...")
 
     try:
-        supabase.table("shopify_products").update({
+        await _run_sync(lambda: supabase.table("shopify_products").update({
             "audit_status": STATUS_PROCESSING,
             "error_log": None,
-        }).eq("id", product_id).execute()
+        }).eq("id", product_id).execute())
 
         return {
             "auto_pilot_enabled": state.get("auto_pilot_enabled", False),
@@ -134,8 +144,8 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
         return {}
 
     try:
-        prod_res = (
-            supabase.table("shopify_products")
+        prod_res = await _run_sync(
+            lambda: supabase.table("shopify_products")
             .select("*")
             .eq("id", product_id)
             .single()
@@ -145,8 +155,8 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
         if not product_data:
             raise ValueError(f"Producto {product_id} no encontrado")
 
-        rules_res = (
-            supabase.table("brand_rules")
+        rules_res = await _run_sync(
+            lambda: supabase.table("brand_rules")
             .select("*")
             .eq("user_id", product_data["user_id"])
             .single()
@@ -219,18 +229,22 @@ async def retrieve_knowledge(state: KatalogState) -> dict[str, Any]:
         return {"rag_knowledge": []}
 
     try:
-        result = genai_client.models.embed_content(
-            model='models/gemini-embedding-2',
-            contents=title,
-            config=types.EmbedContentConfig(output_dimensionality=1536)
+        result = await _run_sync(
+            lambda: genai_client.models.embed_content(
+                model='models/gemini-embedding-2',
+                contents=title,
+                config=types.EmbedContentConfig(output_dimensionality=1536)
+            )
         )
         vector = result.embeddings[0].values
 
-        rpc_res = supabase.rpc("match_knowledge", {
-            "query_embedding": vector,
-            "match_threshold": 0.5,
-            "match_count": 3,
-        }).execute()
+        rpc_res = await _run_sync(
+            lambda: supabase.rpc("match_knowledge", {
+                "query_embedding": vector,
+                "match_threshold": 0.5,
+                "match_count": 3,
+            }).execute()
+        )
 
         matches = rpc_res.data or []
         print(f"📚 [Nodo 2B] {len(matches)} consejos recuperados de la Knowledge Base.")
@@ -386,13 +400,13 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
         score = proposal_dict.get("audit_score", 80)
         audit_log_data = proposal_dict.get("audit_log", [])
 
-        supabase.table("shopify_products").update({
+        await _run_sync(lambda: supabase.table("shopify_products").update({
             "ai_proposal": proposal_dict,
             "audit_score": score,
             "audit_log": audit_log_data,
             "audit_status": STATUS_READY_TO_PUBLISH,
             "error_log": None,
-        }).eq("id", state["product_id"]).execute()
+        }).eq("id", state["product_id"]).execute())
 
         print("✅ [Nodo 5] Producto marcado como READY_TO_PUBLISH.")
         if not state.get("auto_pilot_enabled", False):
@@ -431,7 +445,12 @@ async def mark_needs_optimization(state: KatalogState) -> dict[str, Any]:
             update_data["audit_score"] = proposal_dict.get("audit_score", 0)
             update_data["audit_log"] = proposal_dict.get("audit_log", [])
 
-        supabase.table("shopify_products").update(update_data).eq("id", product_id).execute()
+        await _run_sync(
+            lambda: supabase.table("shopify_products")
+            .update(update_data)
+            .eq("id", product_id)
+            .execute()
+        )
         print(f"🟠 [Nodo 5B] Producto {product_id} marcado como NEEDS_OPTIMIZATION.")
         return {"status": STATUS_NEEDS_OPTIMIZATION}
     except Exception as e:
@@ -465,8 +484,8 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
         return {"error": "La propuesta aprobada no contiene título o descripción HTML."}
 
     try:
-        integration_res = (
-            supabase.table("integrations")
+        integration_res = await _run_sync(
+            lambda: supabase.table("integrations")
             .select("shop_url,access_token")
             .eq("user_id", user_id)
             .eq("provider", "shopify")
@@ -486,15 +505,15 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
         )
 
         published_at = datetime.now().isoformat()
-        supabase.table("shopify_products").update({
+        await _run_sync(lambda: supabase.table("shopify_products").update({
             "audit_status": STATUS_OPTIMIZED,
             "current_title": title,
             "current_body_html": html,
             "last_audit_at": published_at,
             "error_log": None,
-        }).eq("id", product_id).execute()
+        }).eq("id", product_id).execute())
 
-        supabase.table("optimizations").insert({
+        await _run_sync(lambda: supabase.table("optimizations").insert({
             "user_id": user_id,
             "product_id": product_id,
             "title_generated": title,
@@ -505,7 +524,7 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
             "tone_used": metadata["tone_used"],
             "description_length": metadata["description_length"],
             "status": "published",
-        }).execute()
+        }).execute())
 
         await charge_profile_credit(user_id)
         print(f"✅ [Nodo 6] Producto {product_id} publicado y marcado como OPTIMIZED.")
