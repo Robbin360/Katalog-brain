@@ -1,6 +1,7 @@
 import asyncio
+import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from dotenv import load_dotenv
@@ -27,10 +28,25 @@ STATUS_NEEDS_OPTIMIZATION = "NEEDS_OPTIMIZATION"
 STATUS_READY_TO_PUBLISH = "READY_TO_PUBLISH"
 STATUS_OPTIMIZED = "OPTIMIZED"
 STATUS_ERROR = "ERROR"
+MAX_SMART_RETRY_ATTEMPTS = 3
+QUOTA_ERROR_MARKERS = (
+    "429",
+    "503",
+    "quota",
+    "resourceexhausted",
+    "rate limit",
+)
 
 
 async def _run_sync(callable_obj):
     return await asyncio.to_thread(callable_obj)
+
+
+def _to_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _proposal_to_dict(proposal: Any) -> dict[str, Any]:
@@ -55,6 +71,115 @@ def _feedback_issues(feedback: Any) -> list[str]:
     if isinstance(feedback, dict):
         return feedback.get("issues_found", ["Errores desconocidos"])
     return getattr(feedback, "issues_found", ["Errores desconocidos"])
+
+
+def _format_validation_detail_item(item: Any) -> str:
+    if not isinstance(item, dict):
+        return str(item)
+
+    raw_loc = item.get("loc") or item.get("location") or item.get("field")
+    if isinstance(raw_loc, (list, tuple)):
+        field = ".".join(str(part) for part in raw_loc) or "__root__"
+    elif raw_loc:
+        field = str(raw_loc)
+    else:
+        field = "__root__"
+
+    message = item.get("msg") or item.get("message") or item.get("error") or "Validation failed"
+    error_type = item.get("type")
+    if error_type:
+        return f"field={field}: {message} (type={error_type})"
+    return f"field={field}: {message}"
+
+
+def _extract_validation_details(error: BaseException) -> str | None:
+    seen: set[int] = set()
+    current: BaseException | None = error
+
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+
+        details = getattr(current, "details", None)
+        if details:
+            return _serialize_validation_details(details)
+
+        errors = getattr(current, "errors", None)
+        if callable(errors):
+            try:
+                validation_errors = errors()
+            except Exception:
+                validation_errors = None
+            if validation_errors:
+                return _serialize_validation_details(validation_errors)
+
+        tool_retry = getattr(current, "tool_retry", None)
+        retry_content = getattr(tool_retry, "content", None)
+        if retry_content:
+            return _serialize_validation_details(retry_content)
+
+        current = current.__cause__ or current.__context__
+
+    return None
+
+
+def _serialize_validation_details(details: Any) -> str:
+    if isinstance(details, list):
+        return "Validation details: " + "; ".join(
+            _format_validation_detail_item(item) for item in details
+        )
+
+    if isinstance(details, dict):
+        return "Validation details: " + json.dumps(
+            details,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    return f"Validation details: {details}"
+
+
+def _format_error_for_log(error: BaseException) -> str:
+    error_message = str(error)
+    validation_details = _extract_validation_details(error)
+    if validation_details and validation_details not in error_message:
+        return f"{error_message} | {validation_details}"
+    return error_message
+
+
+def _is_retryable_quota_error(error_message: str) -> bool:
+    normalized_error = error_message.lower()
+    return any(marker in normalized_error for marker in QUOTA_ERROR_MARKERS)
+
+
+def _next_retry_at(error_message: str) -> str:
+    now_utc = datetime.now(timezone.utc)
+    if "per day" in error_message.lower():
+        return (
+            now_utc + timedelta(days=1)
+        ).replace(hour=0, minute=1, second=0, microsecond=0).isoformat()
+    return (now_utc + timedelta(minutes=5)).isoformat()
+
+
+def _error_retry_update(state: KatalogState, error_message: str) -> dict[str, Any]:
+    current_retry_attempts = _to_int(state.get("retry_attempts"))
+
+    if _is_retryable_quota_error(error_message):
+        new_retry = current_retry_attempts + 1
+        next_retry_at = (
+            None
+            if new_retry >= MAX_SMART_RETRY_ATTEMPTS
+            else _next_retry_at(error_message)
+        )
+    else:
+        new_retry = MAX_SMART_RETRY_ATTEMPTS
+        next_retry_at = None
+
+    return {
+        "audit_status": STATUS_ERROR,
+        "error_log": error_message,
+        "retry_attempts": new_retry,
+        "next_retry_at": next_retry_at,
+    }
 
 
 def _optimization_metadata(
@@ -85,12 +210,18 @@ def _optimization_metadata(
     }
 
 
-async def mark_product_error(product_id: str, error_message: str) -> None:
+async def mark_product_error(
+    product_id: str,
+    error_message: str,
+    state: KatalogState,
+) -> None:
     try:
-        await _run_sync(lambda: supabase.table("shopify_products").update({
-            "audit_status": STATUS_ERROR,
-            "error_log": error_message,
-        }).eq("id", product_id).execute())
+        await _run_sync(
+            lambda: supabase.table("shopify_products")
+            .update(_error_retry_update(state, error_message))
+            .eq("id", product_id)
+            .execute()
+        )
     except Exception as e:
         print(f"❌ [Supabase] No se pudo registrar ERROR para producto {product_id}: {e}")
 
@@ -118,6 +249,18 @@ async def start_processing(state: KatalogState) -> dict[str, Any]:
     print(f"🚦 [Nodo 0] Producto {product_id} entra en PROCESSING...")
 
     try:
+        current = await _run_sync(
+            lambda: supabase.table("shopify_products")
+            .select("audit_status")
+            .eq("id", product_id)
+            .single()
+            .execute()
+        )
+        current_status = (current.data or {}).get("audit_status")
+        if current_status in (STATUS_OPTIMIZED, STATUS_READY_TO_PUBLISH):
+            print(f"⛔ [Nodo 0] Producto {product_id} ya está {current_status}. Abortando para evitar amnesia de estado.")
+            return {"error": f"Producto ya está {current_status}. No se puede re-procesar."}
+
         await _run_sync(lambda: supabase.table("shopify_products").update({
             "audit_status": STATUS_PROCESSING,
             "error_log": None,
@@ -184,6 +327,7 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
         return {
             "user_id": str(product_data["user_id"]),
             "auto_pilot_enabled": state.get("auto_pilot_enabled", False),
+            "retry_attempts": _to_int(product_data.get("retry_attempts")),
             "product_context": context,
             "brand_rules": rules,
         }
@@ -310,7 +454,7 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
         final_data = getattr(result, "data", getattr(result, "output", result))
         return {"final_proposal": final_data}
     except Exception as e:
-        error_message = str(e)
+        error_message = _format_error_for_log(e)
         print(f"❌ [Nodo 3] Error de IA: {error_message}")
         return {"error": error_message}
 
@@ -350,7 +494,7 @@ async def review_proposal(state: KatalogState) -> dict[str, Any]:
         print(f"🔎 [Nodo 4] Veredicto del Juez: {feed_data}")
         return {"critic_feedback": feed_data, "iterations": iteration}
     except Exception as e:
-        error_message = str(e)
+        error_message = _format_error_for_log(e)
         print(f"❌ [Nodo 4] Error del Juez: {error_message}")
         return {"error": error_message, "iterations": iteration}
 
@@ -406,6 +550,8 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
             "audit_log": audit_log_data,
             "audit_status": STATUS_READY_TO_PUBLISH,
             "error_log": None,
+            "retry_attempts": 0,
+            "next_retry_at": None,
         }).eq("id", state["product_id"]).execute())
 
         print("✅ [Nodo 5] Producto marcado como READY_TO_PUBLISH.")
@@ -416,9 +562,9 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
             else:
                 print("⚠️ [Créditos] No se cobró crédito: user_id ausente.")
 
-        return {"status": STATUS_READY_TO_PUBLISH}
+        return {"status": STATUS_READY_TO_PUBLISH, "retry_attempts": 0}
     except Exception as e:
-        error_message = str(e)
+        error_message = _format_error_for_log(e)
         print(f"❌ [Nodo 5] Error guardando propuesta: {error_message}")
         return {"error": error_message}
 
@@ -511,6 +657,8 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
             "current_body_html": html,
             "last_audit_at": published_at,
             "error_log": None,
+            "retry_attempts": 0,
+            "next_retry_at": None,
         }).eq("id", product_id).execute())
 
         await _run_sync(lambda: supabase.table("optimizations").insert({
@@ -528,9 +676,9 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
 
         await charge_profile_credit(user_id)
         print(f"✅ [Nodo 6] Producto {product_id} publicado y marcado como OPTIMIZED.")
-        return {"status": STATUS_OPTIMIZED}
+        return {"status": STATUS_OPTIMIZED, "retry_attempts": 0}
     except Exception as e:
-        error_message = str(e)
+        error_message = _format_error_for_log(e)
         print(f"❌ [Nodo 6] Error publicando producto {product_id}: {error_message}")
         return {"error": error_message}
 
@@ -547,7 +695,7 @@ async def error_handler(state: KatalogState) -> dict[str, Any]:
     )
     error_message = str(state.get("error") or fallback_message)
     print(f"🧯 [Error Handler] Marcando producto {product_id} como ERROR: {error_message}")
-    await mark_product_error(product_id, error_message)
+    await mark_product_error(product_id, error_message, state)
     return {"status": STATUS_ERROR}
 
 

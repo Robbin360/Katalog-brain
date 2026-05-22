@@ -11,7 +11,7 @@ class InspectorResult(BaseModel):
 
 # 2. EL AGENTE (Rápido, barato y letal)
 inspector_agent = Agent(
-    model='google-gla:gemini-3-flash-preview', # <-- El modelo ultrarrápido
+    model='google-gla:gemini-3.5-flash', # <-- El modelo ultrarrápido
     output_type=InspectorResult,
     system_prompt=(
         "You are a ruthless E-commerce Conversion Rate (CRO) and SEO Auditor. "

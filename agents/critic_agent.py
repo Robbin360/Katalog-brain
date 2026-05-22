@@ -10,6 +10,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+MAX_RETRIES = 3
+STRICT_JSON_OUTPUT_RULE = (
+    " STRICT RULE: Your output MUST be a pure JSON object matching the schema. "
+    "DO NOT include markdown code blocks like ```json. "
+    "DO NOT exceed character limits for titles. "
+    "Ensure ALL metadata fields are present."
+)
 
 
 def _status_code(error: BaseException) -> int | None:
@@ -43,24 +50,30 @@ def _is_retryable_provider_error(error: BaseException) -> bool:
 
 
 primary_critic = Agent(
-    model='google-gla:gemini-3-flash-preview', 
+    model='google-gla:gemini-3.5-flash', 
     output_type=CriticFeedback,
+    retries=MAX_RETRIES,
+    output_retries=MAX_RETRIES,
     system_prompt=(
         "You are a $100B SaaS Quality Auditor. "
         "Your logic is binary: PERFECT or FAILED. "
         "You have zero tolerance for forbidden words or poor SEO. "
         "Your instructions to the writer must be surgical and direct."
+        + STRICT_JSON_OUTPUT_RULE
     )
 )
 
 fallback_critic = Agent(
-    model='groq:llama-3.1-8b-instant',
+    model='groq:openai/gpt-oss-120b',
     output_type=CriticFeedback,
+    retries=MAX_RETRIES,
+    output_retries=MAX_RETRIES,
     system_prompt=(
         "You are a strict QA checker for Shopify product copy. "
         "Return FAILED unless all brand rules, forbidden-word rules, and SEO constraints pass. "
         "List concrete issues and short fix instructions. "
         "Return only valid structured data matching the schema."
+        + STRICT_JSON_OUTPUT_RULE
     )
 )
 

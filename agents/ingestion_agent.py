@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ingestion_agent = Agent(
-    model='google-gla:gemini-3-flash-preview',
+    model='google-gla:gemini-3.5-flash',
     output_type=IngestionResult,
     system_prompt=(
         "Eres un Bibliotecario de E-commerce. "

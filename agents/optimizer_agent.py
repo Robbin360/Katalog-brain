@@ -10,6 +10,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+MAX_RETRIES = 3
+STRICT_JSON_OUTPUT_RULE = (
+    " STRICT RULE: Your output MUST be a pure JSON object matching the schema. "
+    "DO NOT include markdown code blocks like ```json. "
+    "DO NOT exceed character limits for titles. "
+    "Ensure ALL metadata fields are present."
+)
 
 
 def _status_code(error: BaseException) -> int | None:
@@ -45,24 +52,30 @@ def _is_retryable_provider_error(error: BaseException) -> bool:
 primary_optimizer = Agent(
     model='google-gla:gemini-3.1-pro-preview',
     output_type=AIProposalOutput,
+    retries=MAX_RETRIES,
+    output_retries=MAX_RETRIES,
     system_prompt=(
         "You are a $100M/year E-commerce Conversion Rate Optimization (CRO) expert. "
         "Your mission is to rewrite Shopify product listings to maximize sales revenue. "
         "You must STRICTLY adhere to the brand's DNA, formatting rules, and NEVER use forbidden words. "
         "You do not write fluff. You write high-converting, technical, and benefit-driven copy. "
         "Output ONLY valid structured data matching the requested schema."
+        + STRICT_JSON_OUTPUT_RULE
     )
 )
 
 fallback_optimizer = Agent(
     model='groq:llama-3.3-70b-versatile',
     output_type=AIProposalOutput,
+    retries=MAX_RETRIES,
+    output_retries=MAX_RETRIES,
     system_prompt=(
         "You are a strict Shopify product copy optimizer. "
         "Rewrite the listing with clear benefits, compliant SEO, and concise conversion copy. "
         "Follow every brand rule exactly. Never use forbidden words. "
         "Keep the title under 70 characters. "
         "Return only valid structured data matching the schema."
+        + STRICT_JSON_OUTPUT_RULE
     )
 )
 
@@ -88,3 +101,12 @@ async def run_optimizer_with_fallback(prompt: str) -> Any:
             "Activando motor Groq Llama 3..."
         )
         return await fallback_optimizer.run(prompt)
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "output validation" in error_msg or "retries" in error_msg:
+            print(
+                f"⚠️ [Fallback] Error de validación en Gemini: {e}. "
+                "Intentando con Groq Llama 3..."
+            )
+            return await fallback_optimizer.run(prompt)
+        raise

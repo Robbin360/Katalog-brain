@@ -9,6 +9,7 @@ class KatalogState(TypedDict, total=False):
     product_id: Required[str]
     user_id: NotRequired[str]
     auto_pilot_enabled: NotRequired[bool]
+    retry_attempts: NotRequired[int]
     product_context: NotRequired[ProductContext]
     brand_rules: NotRequired[BrandRules]
     

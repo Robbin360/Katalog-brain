@@ -147,6 +147,21 @@ async def optimize_product(request: OptimizeRequest):
     print(f"🚀 [API] Petición recibida: Optimizar producto ID {clean_id}")
     
     try:
+        # 0. Verificar que el producto no esté ya OPTIMIZED o READY_TO_PUBLISH
+        status_check = await run_sync_io(
+            lambda: supabase.table('shopify_products')
+            .select('audit_status')
+            .eq('id', clean_id)
+            .single()
+            .execute()
+        )
+        current_status = (status_check.data or {}).get('audit_status')
+        if current_status in ("OPTIMIZED", "READY_TO_PUBLISH"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Producto ya está {current_status}. No se puede re-optimizar."
+            )
+
         # 1. Definimos el estado inicial para el flujo de LangGraph
         initial_state = {"product_id": clean_id}
         
