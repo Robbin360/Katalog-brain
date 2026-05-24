@@ -28,14 +28,6 @@ STATUS_NEEDS_OPTIMIZATION = "NEEDS_OPTIMIZATION"
 STATUS_READY_TO_PUBLISH = "READY_TO_PUBLISH"
 STATUS_OPTIMIZED = "OPTIMIZED"
 STATUS_ERROR = "ERROR"
-MAX_SMART_RETRY_ATTEMPTS = 3
-QUOTA_ERROR_MARKERS = (
-    "429",
-    "503",
-    "quota",
-    "resourceexhausted",
-    "rate limit",
-)
 
 
 async def _run_sync(callable_obj):
@@ -146,36 +138,47 @@ def _format_error_for_log(error: BaseException) -> str:
     return error_message
 
 
-def _is_retryable_quota_error(error_message: str) -> bool:
-    normalized_error = error_message.lower()
-    return any(marker in normalized_error for marker in QUOTA_ERROR_MARKERS)
-
-
-def _next_retry_at(error_message: str) -> str:
-    now_utc = datetime.now(timezone.utc)
-    if "per day" in error_message.lower():
-        return (
-            now_utc + timedelta(days=1)
-        ).replace(hour=0, minute=1, second=0, microsecond=0).isoformat()
-    return (now_utc + timedelta(minutes=5)).isoformat()
-
-
 def _error_retry_update(state: KatalogState, error_message: str) -> dict[str, Any]:
     current_retry_attempts = _to_int(state.get("retry_attempts"))
+    new_retry = current_retry_attempts + 1
+    if not error_message:
+        error_message = ""
+    err_lower = error_message.lower()
 
-    if _is_retryable_quota_error(error_message):
-        new_retry = current_retry_attempts + 1
-        next_retry_at = (
-            None
-            if new_retry >= MAX_SMART_RETRY_ATTEMPTS
-            else _next_retry_at(error_message)
-        )
+    # Caso A: Límite por Minuto (RPM)
+    if ("429" in err_lower or "rate limit" in err_lower) and "day" not in err_lower:
+        next_retry_at = (datetime.now(timezone.utc) + timedelta(minutes=2)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        audit_status = 'ERROR'
+        
+    # Caso B: Límite Diario Agotado (RPD)
+    elif "429" in err_lower and ("day" in err_lower or "quota" in err_lower or "resourceexhausted" in err_lower):
+        next_time = datetime.now(timezone.utc).replace(hour=0, minute=5, second=0, microsecond=0) + timedelta(days=1)
+        next_retry_at = next_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+        audit_status = 'ERROR'
+        
+    # Caso C: Caída de Servidor Temporal
+    elif any(x in err_lower for x in ["503", "502", "unavailable", "overloaded"]):
+        next_retry_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        audit_status = 'ERROR'
+        
+    # Caso D: Error Fatal (No Reintentable)
+    elif any(x in err_lower for x in ["401", "unauthorized", "invalid token", "validationerror", "404"]):
+        new_retry = 3
+        next_retry_at = None
+        audit_status = 'ERROR'
+        
+    # Default Fallback (Otros errores no clasificados se tratan como no reintentables)
     else:
-        new_retry = MAX_SMART_RETRY_ATTEMPTS
+        new_retry = 3
+        next_retry_at = None
+        audit_status = 'ERROR'
+
+    # Nota de Seguridad: Si el reintento alcanza o supera 3, congelamos
+    if new_retry >= 3:
         next_retry_at = None
 
     return {
-        "audit_status": STATUS_ERROR,
+        "audit_status": audit_status,
         "error_log": error_message,
         "retry_attempts": new_retry,
         "next_retry_at": next_retry_at,
@@ -264,7 +267,8 @@ async def start_processing(state: KatalogState) -> dict[str, Any]:
         await _run_sync(lambda: supabase.table("shopify_products").update({
             "audit_status": STATUS_PROCESSING,
             "error_log": None,
-        }).eq("id", product_id).execute())
+            "updated_at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        }, returning="representation").eq("id", product_id).execute())
 
         return {
             "auto_pilot_enabled": state.get("auto_pilot_enabled", False),
@@ -298,10 +302,21 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
         if not product_data:
             raise ValueError(f"Producto {product_id} no encontrado")
 
+        user_id = str(product_data["user_id"])
+        profile_res = await _run_sync(
+            lambda: supabase.table("profiles")
+            .select("auto_pilot_enabled")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+        profile_data = profile_res.data or {}
+        auto_pilot_enabled = bool(profile_data.get("auto_pilot_enabled", False))
+
         rules_res = await _run_sync(
             lambda: supabase.table("brand_rules")
             .select("*")
-            .eq("user_id", product_data["user_id"])
+            .eq("user_id", user_id)
             .single()
             .execute()
         )
@@ -325,8 +340,8 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
         )
 
         return {
-            "user_id": str(product_data["user_id"]),
-            "auto_pilot_enabled": state.get("auto_pilot_enabled", False),
+            "user_id": user_id,
+            "auto_pilot_enabled": auto_pilot_enabled,
             "retry_attempts": _to_int(product_data.get("retry_attempts")),
             "product_context": context,
             "brand_rules": rules,
@@ -558,7 +573,10 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
         if not state.get("auto_pilot_enabled", False):
             user_id = state.get("user_id")
             if user_id:
-                await charge_profile_credit(user_id)
+                await _run_sync(
+                    lambda: supabase.rpc("increment_profile_credits_used", {"p_user_id": user_id}).execute()
+                )
+                print(f"💳 [Créditos] Crédito consumido para usuario {user_id} (READY_TO_PUBLISH).")
             else:
                 print("⚠️ [Créditos] No se cobró crédito: user_id ausente.")
 
@@ -650,7 +668,7 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
             html=html,
         )
 
-        published_at = datetime.now().isoformat()
+        published_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         await _run_sync(lambda: supabase.table("shopify_products").update({
             "audit_status": STATUS_OPTIMIZED,
             "current_title": title,
@@ -659,7 +677,7 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
             "error_log": None,
             "retry_attempts": 0,
             "next_retry_at": None,
-        }).eq("id", product_id).execute())
+        }, returning="representation").eq("id", product_id).execute())
 
         await _run_sync(lambda: supabase.table("optimizations").insert({
             "user_id": user_id,
@@ -674,7 +692,10 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
             "status": "published",
         }).execute())
 
-        await charge_profile_credit(user_id)
+        await _run_sync(
+            lambda: supabase.rpc("increment_profile_credits_used", {"p_user_id": user_id}).execute()
+        )
+        print(f"💳 [Créditos] Crédito consumido para usuario {user_id} (OPTIMIZED).")
         print(f"✅ [Nodo 6] Producto {product_id} publicado y marcado como OPTIMIZED.")
         return {"status": STATUS_OPTIMIZED, "retry_attempts": 0}
     except Exception as e:

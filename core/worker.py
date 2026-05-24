@@ -145,7 +145,7 @@ async def auto_pilot_patrol() -> None:
                             "error_log": r,
                             "audit_status": st,
                             "updated_at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                        })
+                        }, returning="representation")
                         .eq("id", pid)
                         .execute()
                     )
@@ -205,10 +205,7 @@ async def auto_pilot_patrol() -> None:
                     batch_limit = min(MAX_PRODUCTS_PER_PATROL, credits_remaining)
                     current_iso_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                     
-                    eligible_filter = (
-                        f"and(audit_status.eq.NEEDS_OPTIMIZATION,retry_attempts.lt.3,or(next_retry_at.lte.{current_iso_time},next_retry_at.is.null)),"
-                        f"and(audit_status.eq.ERROR,retry_attempts.lt.3,or(next_retry_at.lte.{current_iso_time},next_retry_at.is.null))"
-                    )
+                    eligible_filter = f"audit_status.eq.NEEDS_OPTIMIZATION,and(audit_status.eq.ERROR,retry_attempts.lt.3,or(next_retry_at.lte.{current_iso_time},next_retry_at.is.null))"
                     
                     products_res = await _run_sync(
                         lambda: supabase.table("shopify_products")
