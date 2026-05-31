@@ -49,6 +49,10 @@ def _proposal_to_dict(proposal: Any) -> dict[str, Any]:
     return {}
 
 
+def _has_proposal(proposal: Any) -> bool:
+    return bool(_proposal_to_dict(proposal))
+
+
 def _feedback_is_perfect(feedback: Any) -> bool:
     if feedback is None:
         return False
@@ -260,7 +264,7 @@ async def start_processing(state: KatalogState) -> dict[str, Any]:
             .execute()
         )
         current_status = (current.data or {}).get("audit_status")
-        if current_status in (STATUS_OPTIMIZED, STATUS_READY_TO_PUBLISH):
+        if current_status == STATUS_OPTIMIZED:
             print(f"⛔ [Nodo 0] Producto {product_id} ya está {current_status}. Abortando para evitar amnesia de estado.")
             return {"error": f"Producto ya está {current_status}. No se puede re-procesar."}
 
@@ -272,6 +276,7 @@ async def start_processing(state: KatalogState) -> dict[str, Any]:
 
         return {
             "auto_pilot_enabled": state.get("auto_pilot_enabled", False),
+            "current_status": state.get("current_status") or current_status,
             "error": None,
         }
     except Exception as e:
@@ -312,6 +317,9 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
         )
         profile_data = profile_res.data or {}
         auto_pilot_enabled = bool(profile_data.get("auto_pilot_enabled", False))
+        db_status = product_data.get("audit_status")
+        current_status = state.get("current_status") or db_status
+        stored_proposal = product_data.get("ai_proposal")
 
         rules_res = await _run_sync(
             lambda: supabase.table("brand_rules")
@@ -339,13 +347,18 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
             formatting_rules=rules_data.get("formatting_rules", ""),
         )
 
-        return {
+        update_data: dict[str, Any] = {
             "user_id": user_id,
             "auto_pilot_enabled": auto_pilot_enabled,
+            "current_status": current_status,
             "retry_attempts": _to_int(product_data.get("retry_attempts")),
             "product_context": context,
             "brand_rules": rules,
         }
+        if _has_proposal(stored_proposal):
+            update_data["final_proposal"] = stored_proposal
+
+        return update_data
     except Exception as e:
         error_message = str(e)
         print(f"❌ [Nodo 1] Error en DB: {error_message}")
@@ -504,7 +517,7 @@ async def review_proposal(state: KatalogState) -> dict[str, Any]:
     """
 
     try:
-        result = await run_critic_with_fallback(prompt)
+        result = await run_critic_with_fallback(prompt, proposal=proposal, rules=rules)
         feed_data = getattr(result, "data", getattr(result, "output", result))
         print(f"🔎 [Nodo 4] Veredicto del Juez: {feed_data}")
         return {"critic_feedback": feed_data, "iterations": iteration}
@@ -725,7 +738,16 @@ def route_after_start(state: KatalogState) -> str:
 
 
 def route_after_fetch(state: KatalogState) -> str:
-    return "error_handler" if state.get("error") else "memory"
+    if state.get("error"):
+        return "error_handler"
+    if (
+        state.get("current_status") == STATUS_READY_TO_PUBLISH
+        and state.get("auto_pilot_enabled") is True
+        and _has_proposal(state.get("final_proposal"))
+    ):
+        print("⚡ [Fast-Track] Producto READY_TO_PUBLISH con propuesta existente. Saltando IA y publicando.")
+        return "publish_to_shopify"
+    return "memory"
 
 
 def route_after_memory(state: KatalogState) -> str:
@@ -776,7 +798,11 @@ def build_graph():
     workflow.add_conditional_edges(
         "fetch_data",
         route_after_fetch,
-        {"memory": "memory", "error_handler": "error_handler"},
+        {
+            "memory": "memory",
+            "publish_to_shopify": "publish_to_shopify",
+            "error_handler": "error_handler",
+        },
     )
     workflow.add_conditional_edges(
         "memory",

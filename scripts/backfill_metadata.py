@@ -8,6 +8,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from agents.reclassifier_agent import classify_with_smart_fallback
+from core.schemas import ReclassificationResult
 
 load_dotenv()
 
@@ -51,8 +52,10 @@ async def process_rows():
             # 2. Extraccion blindada (compatible con PydanticAI v1/v2)
             new_data = getattr(result, 'data', getattr(result, 'output', result))
 
-            # 3. Conversion segura a diccionario
-            new_dict = new_data.model_dump() if hasattr(new_data, 'model_dump') else dict(new_data)
+            # 3. Normalizacion Pydantic y Excretion Filter
+            if not isinstance(new_data, ReclassificationResult):
+                new_data = ReclassificationResult.model_validate(new_data)
+            new_dict = new_data.to_supabase_dict()
 
             # 4. Fusion de metadatos (preserva lo antiguo, anade lo nuevo)
             enriched_metadata = {**old_metadata, **new_dict}

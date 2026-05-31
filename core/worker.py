@@ -42,8 +42,25 @@ async def _claim_retryable_products(
     claimed_ids = {str(product.get("id")) for product in (claim_res.data or []) if product.get("id")}
 
     if not claimed_ids:
-        print("ℹ️ [Auto-Pilot] Supabase no devolvió filas (retorno minimal). Aplicando fallback seguro: asumiendo éxito para todo el lote.")
-        return products
+        claim_window_start = (
+            datetime.now(timezone.utc) - timedelta(seconds=30)
+        ).strftime('%Y-%m-%dT%H:%M:%SZ')
+        confirm_res = await _run_sync(
+            lambda: supabase.table("shopify_products")
+            .select("id")
+            .in_("id", selected_ids)
+            .eq("audit_status", STATUS_PROCESSING)
+            .gte("updated_at", claim_window_start)
+            .execute()
+        )
+        claimed_ids = {
+            str(product.get("id"))
+            for product in (confirm_res.data or [])
+            if product.get("id")
+        }
+        if not claimed_ids:
+            print("ℹ️ [Auto-Pilot] Claim sin filas confirmadas. Otro worker pudo ganar la carrera; lote omitido.")
+            return []
 
     return [product for product in products if str(product.get("id")) in claimed_ids]
 
@@ -205,7 +222,11 @@ async def auto_pilot_patrol() -> None:
                     batch_limit = min(MAX_PRODUCTS_PER_PATROL, credits_remaining)
                     current_iso_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                     
-                    eligible_filter = f"audit_status.eq.NEEDS_OPTIMIZATION,and(audit_status.eq.ERROR,retry_attempts.lt.3,or(next_retry_at.lte.{current_iso_time},next_retry_at.is.null))"
+                    eligible_filter = (
+                        f"and(audit_status.eq.NEEDS_OPTIMIZATION,retry_attempts.lt.3,or(next_retry_at.lte.{current_iso_time},next_retry_at.is.null)),"
+                        f"audit_status.eq.READY_TO_PUBLISH,"
+                        f"and(audit_status.eq.ERROR,retry_attempts.lt.3,or(next_retry_at.lte.{current_iso_time},next_retry_at.is.null))"
+                    )
                     
                     products_res = await _run_sync(
                         lambda: supabase.table("shopify_products")
@@ -236,10 +257,12 @@ async def auto_pilot_patrol() -> None:
                             continue
                         
                         try:
-                            print(f"🚀 [Auto-Pilot] Optimizando producto ID {product_id}...")
+                            action = "Publicando" if product.get("audit_status") == "READY_TO_PUBLISH" else "Optimizando"
+                            print(f"🚀 [Auto-Pilot] {action} producto ID {product_id}...")
                             final_state = await katalog_agent.ainvoke({
                                 "product_id": product_id,
-                                "auto_pilot_enabled": True
+                                "auto_pilot_enabled": True,
+                                "current_status": product.get("audit_status"),
                             })
                             
                             if final_state.get("error") or final_state.get("status") == "ERROR":

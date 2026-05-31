@@ -4,10 +4,8 @@ import httpx
 from google.genai import errors as genai_errors
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
+from core.model_config import OPTIMIZER_FALLBACK_MODEL, OPTIMIZER_PRIMARY_MODEL
 from core.schemas import AIProposalOutput
-from dotenv import load_dotenv
-
-load_dotenv()
 
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 MAX_RETRIES = 3
@@ -50,10 +48,11 @@ def _is_retryable_provider_error(error: BaseException) -> bool:
 
 
 primary_optimizer = Agent(
-    model='google-gla:gemini-3.1-pro-preview',
+    model=OPTIMIZER_PRIMARY_MODEL,
     output_type=AIProposalOutput,
     retries=MAX_RETRIES,
     output_retries=MAX_RETRIES,
+    defer_model_check=True,
     system_prompt=(
         "You are a $100M/year E-commerce Conversion Rate Optimization (CRO) expert. "
         "Your mission is to rewrite Shopify product listings to maximize sales revenue. "
@@ -65,10 +64,11 @@ primary_optimizer = Agent(
 )
 
 fallback_optimizer = Agent(
-    model='groq:llama-3.3-70b-versatile',
+    model=OPTIMIZER_FALLBACK_MODEL,
     output_type=AIProposalOutput,
     retries=MAX_RETRIES,
     output_retries=MAX_RETRIES,
+    defer_model_check=True,
     system_prompt=(
         "You are a strict Shopify product copy optimizer. "
         "Rewrite the listing with clear benefits, compliant SEO, and concise conversion copy. "

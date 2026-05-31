@@ -9,13 +9,14 @@ class KatalogState(TypedDict, total=False):
     product_id: Required[str]
     user_id: NotRequired[str]
     auto_pilot_enabled: NotRequired[bool]
+    current_status: NotRequired[str]
     retry_attempts: NotRequired[int]
     product_context: NotRequired[ProductContext]
     brand_rules: NotRequired[BrandRules]
     
     # Memoria y Propuestas
     letta_memory: NotRequired[str]
-    final_proposal: NotRequired[AIProposalOutput]
+    final_proposal: NotRequired[AIProposalOutput | dict[str, Any]]
 
     # RAG - Knowledge Base Retrieval
     rag_knowledge: NotRequired[list[dict[str, Any]]]

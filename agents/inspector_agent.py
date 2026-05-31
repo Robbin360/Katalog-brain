@@ -1,8 +1,6 @@
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
-from dotenv import load_dotenv
-
-load_dotenv()
+from core.model_config import INSPECTOR_MODEL
 
 # 1. EL MOLDE ESTRICTO (Lo que la IA está obligada a responder)
 class InspectorResult(BaseModel):
@@ -11,8 +9,9 @@ class InspectorResult(BaseModel):
 
 # 2. EL AGENTE (Rápido, barato y letal)
 inspector_agent = Agent(
-    model='google-gla:gemini-3.5-flash', # <-- El modelo ultrarrápido
+    model=INSPECTOR_MODEL, # <-- El modelo ultrarrápido
     output_type=InspectorResult,
+    defer_model_check=True,
     system_prompt=(
         "You are a ruthless E-commerce Conversion Rate (CRO) and SEO Auditor. "
         "I will give you a Shopify product title and its HTML description. "
