@@ -14,6 +14,7 @@ from agents.critic_agent import run_critic_with_fallback
 from agents.optimizer_agent import run_optimizer_with_fallback
 from core.schemas import BrandRules, ProductContext
 from core.shopify_tools import publish_to_shopify as publish_product_to_shopify
+from core.shopify_api import get_product_taxonomy
 from core.state import KatalogState
 
 load_dotenv()
@@ -347,6 +348,35 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
             formatting_rules=rules_data.get("formatting_rules", ""),
         )
 
+        # --- Taxonomía Predictiva de Shopify ---
+        shopify_id = str(product_data.get("shopify_id") or "")
+        taxonomy_text = ""
+        taxonomy_ok = True
+
+        if shopify_id:
+            try:
+                integration_res = await _run_sync(
+                    lambda: supabase.table("integrations")
+                    .select("shop_url, access_token")
+                    .eq("user_id", user_id)
+                    .eq("provider", "shopify")
+                    .maybe_single()
+                    .execute()
+                )
+                integration_data = integration_res.data or {}
+                shop_domain = integration_data.get("shop_url", "")
+                access_token = integration_data.get("access_token", "")
+
+                if shop_domain and access_token:
+                    taxonomy_text, taxonomy_ok = await get_product_taxonomy(
+                        shopify_numeric_id=shopify_id,
+                        shop_domain=shop_domain,
+                        access_token=access_token
+                    )
+            except Exception as e:
+                print(f"⚠️ [Nodo 1] Error obteniendo taxonomía: {e}")
+                taxonomy_ok = False
+
         update_data: dict[str, Any] = {
             "user_id": user_id,
             "auto_pilot_enabled": auto_pilot_enabled,
@@ -354,6 +384,8 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
             "retry_attempts": _to_int(product_data.get("retry_attempts")),
             "product_context": context,
             "brand_rules": rules,
+            "taxonomy_context": taxonomy_text,
+            "taxonomy_available": taxonomy_ok,
         }
         if _has_proposal(stored_proposal):
             update_data["final_proposal"] = stored_proposal
@@ -442,6 +474,23 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     feedback = state.get("critic_feedback")
     rag = state.get("rag_knowledge", [])
 
+    taxonomy_context = state.get("taxonomy_context", "")
+    taxonomy_available = state.get("taxonomy_available", True)
+
+    taxonomy_injection = ""
+    if taxonomy_context:
+        taxonomy_injection = f"""
+    ## REQUISITOS TAXONÓMICOS DE SHOPIFY (MANDATORIOS PARA GOOGLE SHOPPING)
+    {taxonomy_context}
+    INSTRUCCIÓN: Integra cada atributo entre corchetes como prosa natural
+    dentro del framework FAB/PAS. Nunca como lista técnica separada.
+"""
+    elif not taxonomy_available:
+        taxonomy_injection = """
+    ## NOTA INTERNA: API de Shopify no disponible.
+    Usa mejores prácticas generales de SEO para la descripción.
+"""
+
     prompt = f"""
     PRODUCT TO OPTIMIZE:
     - Title: {context.current_title}
@@ -459,7 +508,7 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     - Forbidden Words: {', '.join(rules.forbidden_words)}
     - DNA: {rules.brand_dna}
     - Formats: {rules.formatting_rules}
-    """
+    {taxonomy_injection}"""
 
     if rag:
         rag_text = "\n".join(

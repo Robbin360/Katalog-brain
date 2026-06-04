@@ -33,3 +33,7 @@ class KatalogState(TypedDict, total=False):
     framework_used: NotRequired[str]
     tone_used: NotRequired[str]
     description_length: NotRequired[int]
+
+    # Taxonomía Predictiva de Shopify
+    taxonomy_context: NotRequired[str]
+    taxonomy_available: NotRequired[bool]

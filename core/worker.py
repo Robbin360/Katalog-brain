@@ -1,9 +1,14 @@
+import os
+import time
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+import stripe
 from core.graph import katalog_agent, supabase
 from agents.inspector_agent import inspector_agent
+
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 PATROL_INTERVAL_SECONDS: int = 30
 MAX_PRODUCTS_PER_PATROL: int = 3
@@ -65,6 +70,55 @@ async def _claim_retryable_products(
     return [product for product in products if str(product.get("id")) in claimed_ids]
 
 
+def _reconcile_stripe_subscriptions() -> int:
+    past_due_res = supabase.table("profiles").select(
+        "id,stripe_subscription_id,subscription_status"
+    ).eq("subscription_status", "past_due").execute()
+    past_due_users: list[dict[str, Any]] = past_due_res.data or []
+
+    if not past_due_users:
+        return 0
+
+    reconciled = 0
+    for i in range(0, len(past_due_users), 10):
+        batch = past_due_users[i:i + 10]
+        for user in batch:
+            sub_id = user.get("stripe_subscription_id")
+            if not sub_id:
+                continue
+            try:
+                subscription = stripe.Subscription.retrieve(sub_id)
+                status = subscription.status
+            except Exception as e:
+                print(f"⚠️ [Stripe Sync] Error consultando suscripción {sub_id} del usuario {user.get('id')}: {e}")
+                continue
+
+            user_id = user.get("id")
+            if status in ("canceled", "unpaid"):
+                supabase.table("profiles").update({
+                    "subscription_status": "inactive",
+                    "plan_tier": "free",
+                    "auto_pilot_enabled": False,
+                    "credits_total": 0,
+                }).eq("id", user_id).execute()
+                reconciled += 1
+            elif status == "active":
+                supabase.table("profiles").update({
+                    "subscription_status": "active",
+                    "auto_pilot_enabled": True,
+                }).eq("id", user_id).execute()
+                reconciled += 1
+
+        if i + 10 < len(past_due_users):
+            time.sleep(0.2)
+
+    return reconciled
+
+
+# Global de control para ejecutar la reconciliación 1 vez por día
+_last_reconciliation_date: date | None = None
+
+
 async def auto_pilot_patrol() -> None:
     """
     Definitive background worker for Katalog Auto-Pilot.
@@ -77,6 +131,19 @@ async def auto_pilot_patrol() -> None:
     print("🤖 [Auto-Pilot] Worker iniciado con arquitectura de 4 fases.")
 
     while True:
+        # ==========================================
+        # 💵 FASE -1: Reconciliación Diaria de Pagos (Stripe Sync)
+        # ==========================================
+        global _last_reconciliation_date
+        try:
+            today = datetime.now(timezone.utc).date()
+            if _last_reconciliation_date != today:
+                reconciled_count = await _run_sync(_reconcile_stripe_subscriptions)
+                print(f"🔍💵 [Stripe Sync] {reconciled_count} usuarios reconciliados con Stripe.")
+                _last_reconciliation_date = today
+        except Exception as stripe_error:
+            print(f"⚠️ [Stripe Sync] Error durante reconciliación: {stripe_error}")
+
         # ==========================================
         # 🧟 FASE 0: Zombie Sweeper (Mantenimiento Global - Sin costo)
         # ==========================================
