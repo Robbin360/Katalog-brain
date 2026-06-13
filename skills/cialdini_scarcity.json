@@ -1,0 +1,6 @@
+{
+  "name": "cialdini_scarcity",
+  "category": "urgency",
+  "applicable_when": ["any"],
+  "instruction": "Menciona el stock disponible como dato natural de la descripción, no como presión artificial. Si el stock es bajo, intégralo como contexto ('quedan pocas unidades de esta edición'). Nunca uses frases de urgencia genéricas como '¡Oferta limitada!' — suena falso."
+}

@@ -12,7 +12,17 @@ from supabase import Client, create_client
 
 from agents.critic_agent import run_critic_with_fallback
 from agents.optimizer_agent import run_optimizer_with_fallback
-from core.schemas import BrandRules, ProductContext
+from agents.orchestrator_agent import orchestrator_agent, OrchestratorDeps
+from agents.researcher_agent import researcher_node, check_enrichment_cache, format_dossier_for_prompt
+from core.helpers import (
+    classify_product_type,
+    calculate_precio_relativo,
+    map_seo_score_to_category,
+    load_skills,
+    get_available_skills,
+    build_product_fingerprint,
+)
+from core.schemas import BrandRules, ProductContext, OrchestratorPlan
 from core.shopify_tools import publish_to_shopify as publish_product_to_shopify
 from core.shopify_api import get_product_taxonomy
 from core.state import KatalogState
@@ -29,6 +39,15 @@ STATUS_NEEDS_OPTIMIZATION = "NEEDS_OPTIMIZATION"
 STATUS_READY_TO_PUBLISH = "READY_TO_PUBLISH"
 STATUS_OPTIMIZED = "OPTIMIZED"
 STATUS_ERROR = "ERROR"
+
+# ─── Cuadrantes del Candado Do-Not-Harm ──────────────────────────────────────
+QUADRANT_NEEDS_OPT      = "NEEDS_OPTIMIZATION"
+QUADRANT_STABLE         = "STABLE_PERFORMING"
+QUADRANT_MONITORING     = "MONITORING"
+QUADRANT_BENCHMARK      = "BENCHMARK"
+QUADRANT_INVESTIGATE    = "INVESTIGATE_CAUSE"
+
+_SKIP_QUADRANTS = {QUADRANT_STABLE, QUADRANT_MONITORING, QUADRANT_BENCHMARK, QUADRANT_INVESTIGATE}
 
 
 async def _run_sync(callable_obj):
@@ -526,14 +545,354 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
         if not is_perf:
             prompt += f"\n⚠️ URGENT CRITIQUE: Fix these issues immediately: {issues}"
 
+    # ─── INYECCIÓN DEL PLAN DEL ORQUESTADOR ──────────────────────────────
+    # Inyectar instrucciones del Orquestador y el dossier del Investigador
+    plan          = state.get("orchestrator_plan")
+    loaded_skills = state.get("loaded_skills", "")
+    research_result = state.get("research_result")
+
+    if plan:
+        # Formatear dossier del Investigador (si existe)
+        dossier_text = format_dossier_for_prompt(research_result) if research_result else ""
+
+        orchestrator_section = f"""
+    ════════════════════════════════════════════════════════
+    INSTRUCCIONES DEL DIRECTOR DE MARKETING (MANDATORIAS)
+    ════════════════════════════════════════════════════════
+    DIAGNÓSTICO: {plan.diagnosis}
+    PROBLEMA PRINCIPAL: {plan.primary_problem}
+    ESTRATEGIA: {plan.copywriter_instructions}
+"""
+        if dossier_text:
+            orchestrator_section += f"""
+    {dossier_text}
+"""
+        if loaded_skills:
+            orchestrator_section += f"""
+    ## SKILLS DE LA BIBLIOTECA (APLICAR OBLIGATORIAMENTE)
+    {loaded_skills}
+"""
+        prompt += orchestrator_section
+
     try:
         result = await run_optimizer_with_fallback(prompt)
         final_data = getattr(result, "data", getattr(result, "output", result))
         return {"final_proposal": final_data}
     except Exception as e:
         error_message = _format_error_for_log(e)
-        print(f"❌ [Nodo 3] Error de IA: {error_message}")
+        print(f"\u274c [Nodo 3] Error de IA: {error_message}")
         return {"error": error_message}
+
+
+# ==========================================
+# \U0001f9e0 NODO 1B: SIFÓN TOTAL (ORQUESTADOR)
+# ==========================================
+async def fetch_db_data_orchestrator(state: KatalogState) -> dict[str, Any]:
+    """
+    Nodo auxiliar: enriquece el estado con datos adicionales para el Orquestador.
+    Se ejecuta DESPUÉS de fetch_db_data existente.
+    Lee métricas de product_metrics y el caché de specs en paralelo.
+
+    TIPOS DE DATOS SUPABASE (verificados via MCP):
+      shopify_products.id         → BIGINT → int(product_id)
+      product_metrics.product_id  → TEXT   → str(product.shopify_id)
+      merchant_alerts.product_id  → BIGINT → int(product_id)
+    """
+    if state.get("error"):
+        return {}
+
+    # product_id es BIGINT en la DB — siempre pasamos int
+    product_id = int(state["product_id"])
+    user_id    = str(state.get("user_id", ""))
+    product    = state.get("product_context")  # puede ser ProductContext o dict
+
+    # Construir el dict de producto para los helpers
+    if product and hasattr(product, "model_dump"):
+        product_dict = product.model_dump()
+        # Recuperar datos adicionales del producto completo desde la DB
+        prod_res = await _run_sync(
+            lambda: supabase.table("shopify_products")
+            .select("*")
+            .eq("id", product_id)
+            .single()
+            .execute()
+        )
+        product_dict = prod_res.data or product_dict
+    else:
+        product_dict = state.get("product", {})
+
+    # Calcular fingerprint para consulta de caché
+    fingerprint = build_product_fingerprint(
+        product_dict.get("vendor", ""),
+        product_dict.get("productType", product_dict.get("product_type", "")),
+        product_dict.get("current_title", product_dict.get("title", "")),
+    )
+
+    # Consulta paralela: métricas + caché de specs
+    # product_metrics.product_id es TEXT → pasamos el shopify_id como str
+    shopify_id = str(product_dict.get("shopify_id", ""))
+
+    async def _get_metrics():
+        try:
+            return await _run_sync(
+                lambda: supabase.table("product_metrics")
+                .select(
+                    "orders_count_7d, orders_count_14d, orders_count_30d, "
+                    "conversion_rate, performance_score, price"
+                )
+                .eq("product_id", shopify_id)
+                .order("measured_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+        except Exception as e:
+            print(f"\u26a0\ufe0f [Orq] Métricas no disponibles: {e}")
+            return None
+
+    metrics_result, cached_specs = await asyncio.gather(
+        _get_metrics(),
+        check_enrichment_cache(fingerprint),
+        return_exceptions=True,
+    )
+
+    # Construir dict de métricas seguro
+    if isinstance(metrics_result, Exception) or metrics_result is None:
+        metrics = {}
+    elif metrics_result.data:
+        metrics = metrics_result.data[0]
+    else:
+        metrics = {}
+
+    if isinstance(cached_specs, Exception):
+        cached_specs = None
+
+    # Cálculos deterministas — sin LLM
+    try:
+        price = float(product_dict.get("price") or 0)
+    except (ValueError, TypeError):
+        price = 0.0
+
+    # Precio de categoría: primero lo buscamos en métricas, sino 0
+    avg_price_in_category = float(metrics.get("price", 0) or 0)
+
+    precio_relativo    = calculate_precio_relativo(price, avg_price_in_category)
+    product_type_class = classify_product_type(product_dict)
+    seo_score_raw      = int(product_dict.get("seo_score_initial", 0) or 0)
+    seo_score_category = map_seo_score_to_category(seo_score_raw)
+    available_skills   = get_available_skills()
+
+    print(
+        f"\U0001f9e0 [Orq] Enriquecimiento: tipo={product_type_class}, "
+        f"precio_rel={precio_relativo}, seo={seo_score_category}, "
+        f"specs={'SI' if cached_specs else 'NO'}, skills={len(available_skills)}"
+    )
+
+    return {
+        "product":            product_dict,
+        "metrics":            metrics,
+        "cached_specs":       cached_specs,
+        "precio_relativo":    precio_relativo,
+        "product_type_class": product_type_class,
+        "seo_score_raw":      seo_score_raw,
+        "seo_score_category": seo_score_category,
+        "available_skills":   available_skills,
+        "fingerprint":        fingerprint,
+    }
+
+
+# ==========================================
+# \U0001f6ab NODO: DO-NOT-HARM (CANDADO PYTHON PURO)
+# ==========================================
+async def do_not_harm_check(state: KatalogState) -> dict[str, Any]:
+    """
+    Candado de protección determinista — NUNCA delega al LLM.
+    Clasifica el producto en uno de 5 cuadrantes y decide si optimizar.
+
+    Usa columnas reales de shopify_products:
+      sales_last_7_days  → INTEGER
+      sales_last_30_days → INTEGER
+      sales_last_90_days → INTEGER
+    """
+    if state.get("error"):
+        return {}
+
+    # product_id es BIGINT → int
+    product_id = int(state["product_id"])
+    product    = state.get("product", {})
+
+    # Leer ventas directamente desde el dict del producto (ya cargado)
+    sales_7d  = int(product.get("sales_last_7_days",  0) or 0)
+    sales_30d = int(product.get("sales_last_30_days", 0) or 0)
+    sales_90d = int(product.get("sales_last_90_days", 0) or 0)
+    seo_score_raw = int(state.get("seo_score_raw", product.get("seo_score_initial", 0)) or 0)
+
+    avg_weekly       = sales_90d / 13 if sales_90d > 0 else 0.0
+    is_consistent    = avg_weekly >= 5
+    is_viral_spike   = sales_7d > (avg_weekly * 2.5) if avg_weekly > 0 else False
+    is_dead          = sales_30d < 3
+    is_poor_copy     = seo_score_raw < 40
+    is_good_copy     = seo_score_raw >= 70
+
+    async def _update_status(update: dict) -> None:
+        """Helper: actualiza shopify_products con product_id BIGINT."""
+        await _run_sync(
+            lambda: supabase.table("shopify_products")
+            .update(update)
+            .eq("id", product_id)
+            .execute()
+        )
+
+    # STABLE PERFORMING — vende consistentemente aunque el copy sea malo
+    if is_consistent and is_poor_copy and not is_viral_spike:
+        await _update_status({"audit_status": QUADRANT_STABLE})
+        print(f"\U0001f6ab [Do-Not-Harm] {product_id} → STABLE_PERFORMING (avg_weekly={avg_weekly:.1f})")
+        return {"product_quadrant": QUADRANT_STABLE}
+
+    # MONITORING — pico viral, esperar 2 semanas antes de tocar
+    if is_viral_spike:
+        monitoring_since_str = product.get("monitoring_since")
+
+        if monitoring_since_str:
+            try:
+                monitoring_since = datetime.fromisoformat(
+                    monitoring_since_str.replace("Z", "+00:00")
+                )
+                weeks_elapsed = (datetime.now(timezone.utc) - monitoring_since).days / 7
+            except (ValueError, TypeError):
+                weeks_elapsed = 0.0
+
+            if weeks_elapsed >= 2:
+                # Pico terminó — limpiar y continuar al análisis normal
+                await _update_status({"monitoring_since": None})
+                print(f"\u23f0 [Do-Not-Harm] {product_id}: pico terminó, optimizando")
+            else:
+                print(f"\U0001f4ca [Do-Not-Harm] {product_id} → MONITORING ({weeks_elapsed:.1f} semanas)")
+                return {"product_quadrant": QUADRANT_MONITORING}
+        else:
+            # Primera vez en MONITORING
+            now_iso = datetime.now(timezone.utc).isoformat()
+            await _update_status({
+                "audit_status": QUADRANT_MONITORING,
+                "monitoring_since": now_iso,
+            })
+            print(f"\U0001f4ca [Do-Not-Harm] {product_id} → MONITORING (inicio)")
+            return {"product_quadrant": QUADRANT_MONITORING}
+
+    # BENCHMARK — vende bien con copy excelente
+    if is_consistent and is_good_copy:
+        await _update_status({"audit_status": QUADRANT_BENCHMARK})
+        print(f"\U0001f3c6 [Do-Not-Harm] {product_id} → BENCHMARK")
+        return {"product_quadrant": QUADRANT_BENCHMARK}
+
+    # INVESTIGATE CAUSE — copy bueno pero no vende
+    if is_dead and is_good_copy:
+        await _update_status({"audit_status": QUADRANT_INVESTIGATE})
+        print(f"\U0001f50d [Do-Not-Harm] {product_id} → INVESTIGATE_CAUSE")
+        return {"product_quadrant": QUADRANT_INVESTIGATE}
+
+    # NEEDS OPTIMIZATION — herida abierta, optimizar
+    print(f"\U0001f3af [Do-Not-Harm] {product_id} → NEEDS_OPTIMIZATION")
+    return {"product_quadrant": QUADRANT_NEEDS_OPT}
+
+
+# ==========================================
+# \U0001f4cb NODO: ORQUESTADOR (PLAN DE VUELO)
+# ==========================================
+async def orchestrator_node(state: KatalogState) -> dict[str, Any]:
+    """
+    Nodo del Orquestador: diseña el Plan de Vuelo.
+    Si falla, usa un plan conservador hardcodeado.
+    Nunca rompe el grafo.
+
+    TIPOS DE DATOS SUPABASE:
+      shopify_products.id         → BIGINT → int(product_id)
+      merchant_alerts.product_id  → BIGINT → int(product_id)
+    """
+    if state.get("error"):
+        return {}
+
+    product_id = int(state["product_id"])
+    user_id    = str(state.get("user_id", ""))
+
+    deps = OrchestratorDeps(
+        product            = state.get("product", {}),
+        metrics            = state.get("metrics", {}),
+        cached_specs       = state.get("cached_specs"),
+        precio_relativo    = state.get("precio_relativo", 1.0),
+        product_type_class = state.get("product_type_class", "GENERIC"),
+        available_skills   = state.get("available_skills", []),
+        seo_score_category = state.get("seo_score_category", "POOR"),
+        seo_score_raw      = state.get("seo_score_raw", 0),
+    )
+
+    try:
+        result = await orchestrator_agent.run(
+            "Diagnostica este producto y genera el Plan de Vuelo.",
+            deps=deps,
+        )
+        plan = result.output   # NO result.data — API correcta de PydanticAI v2
+        print(f"\U0001f4cb [Orquestador] Plan generado: {plan.primary_problem} / {plan.product_quadrant}")
+
+    except Exception as e:
+        print(f"\u274c [Orquestador] Falló para producto {product_id}: {e}")
+        # Plan conservador — el sistema nunca se detiene
+        plan = OrchestratorPlan(
+            diagnosis                 = "Orquestador no disponible — plan conservador",
+            primary_problem           = "poor_copy",
+            activate_researcher_agent = False,
+            research_instructions     = None,
+            copywriter_instructions   = (
+                "Mejora el copy usando buenas prácticas de SEO y e-commerce. "
+                "Estructura: H2 con keyword + párrafo de beneficios + 3 bullets. "
+                "NO inventes especificaciones técnicas."
+            ),
+            judge_instructions        = (
+                "Verifica que el copy no contenga afirmaciones técnicas sin respaldo. "
+                "Rechaza si hay garantías o materiales inventados."
+            ),
+            skills_to_inject          = [],
+            do_not_harm_triggered     = False,
+            product_quadrant          = QUADRANT_NEEDS_OPT,
+            fact_anchored_alert       = False,
+            merchant_alert_message    = None,
+        )
+
+    # Guardar diagnóstico en Supabase para auditoría
+    # shopify_products.id es BIGINT → int(product_id)
+    await _run_sync(
+        lambda: supabase.table("shopify_products")
+        .update({
+            "orchestrator_diagnosis": plan.model_dump(),
+            "audit_status":           plan.product_quadrant,
+        })
+        .eq("id", product_id)
+        .execute()
+    )
+
+    # Si hay alerta para el comerciante — guardar en merchant_alerts
+    # merchant_alerts.product_id es BIGINT → int(product_id)
+    if plan.fact_anchored_alert and plan.merchant_alert_message and user_id:
+        try:
+            await _run_sync(
+                lambda: supabase.table("merchant_alerts").insert({
+                    "user_id":    user_id,
+                    "product_id": product_id,   # BIGINT → int
+                    "alert_type": "missing_value_justification",
+                    "message":    plan.merchant_alert_message,
+                    "status":     "unread",
+                }).execute()
+            )
+            print(f"\U0001f514 [Orquestador] Alerta de comerciante guardada para producto {product_id}")
+        except Exception as e:
+            print(f"\u26a0\ufe0f [Orquestador] No se pudo guardar la alerta: {e}")
+
+    # Pre-cargar skills para el Redactor
+    loaded_skills = load_skills(plan.skills_to_inject)
+
+    return {
+        "orchestrator_plan": plan,
+        "loaded_skills":     loaded_skills,
+    }
 
 
 # ==========================================
@@ -563,6 +922,19 @@ async def review_proposal(state: KatalogState) -> dict[str, Any]:
     If it uses ANY forbidden words, reject it (is_perfect=False) and list them.
     If the title is over 70 chars, reject it.
     Provide actionable feedback for the writer to fix it.
+    """
+
+    # Inyectar instrucciones del Juez desde el Plan del Orquestador
+    plan = state.get("orchestrator_plan")
+    if plan and plan.judge_instructions:
+        prompt += f"""
+
+    INSTRUCCIONES ESPECÍFICAS DEL DIRECTOR (VERIFICAR OBLIGATORIAMENTE):
+    {plan.judge_instructions}
+
+    DOSSIER VERIFICADO (fuente única de hechos — cualquier afirmación técnica
+    que no esté en este dossier DEBE ser rechazada):
+    {state.get('cached_specs') or 'Sin specs verificadas'}
     """
 
     try:
@@ -770,7 +1142,8 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
 # 🧯 NODO GLOBAL DE ERROR
 # ==========================================
 async def error_handler(state: KatalogState) -> dict[str, Any]:
-    product_id = str(state["product_id"])
+    # product_id es BIGINT (int) en DB — usamos str() solo para display
+    product_id = state["product_id"]
     fallback_message = (
         "El Juez no devolvió feedback legible."
         if state.get("critic_feedback") is None
@@ -781,6 +1154,9 @@ async def error_handler(state: KatalogState) -> dict[str, Any]:
     await mark_product_error(product_id, error_message, state)
     return {"status": STATUS_ERROR}
 
+
+
+# ─── ENRUTADORES ORIGINALES (flujo base) ─────────────────────────────────────
 
 def route_after_start(state: KatalogState) -> str:
     return "error_handler" if state.get("error") else "fetch_data"
@@ -823,22 +1199,69 @@ def route_after_needs_optimization(state: KatalogState) -> str:
     return "error_handler" if state.get("error") else "end"
 
 
+# ─── ENRUTADORES DEL ORQUESTADOR ───────────────────────────────────────────────────────
+
+def route_after_enrich(state: KatalogState) -> str:
+    """Después del enriquecimiento — ir al candado o al manejador de errores."""
+    if state.get("error"):
+        return "error_handler"
+    return "do_not_harm"
+
+
+def route_after_do_not_harm(state: KatalogState) -> str:
+    """
+    Si el producto no necesita optimización → END inmediato.
+    El Orquestador nunca ve estos productos.
+    """
+    if state.get("error"):
+        return "error_handler"
+    quadrant = state.get("product_quadrant", QUADRANT_NEEDS_OPT)
+    if quadrant in _SKIP_QUADRANTS:
+        return "end"
+    return "orchestrator"
+
+
+def route_after_orchestrator(state: KatalogState) -> str:
+    """
+    El Orquestador ya decidió — Python ejecuta su decisión.
+    """
+    if state.get("error"):
+        return "error_handler"
+    plan = state.get("orchestrator_plan")
+    if not plan:
+        return "ai_writer"   # fallback seguro
+    if plan.activate_researcher_agent:
+        return "researcher"
+    return "ai_writer"
+
+
+# ─── GRAFO COMPLETO ──────────────────────────────────────────────────────────────────
+
 def build_graph():
     workflow = StateGraph(KatalogState)
 
+    # ─ Nodos existentes ────────────────────────────────────────────────────────────
     workflow.add_node("start_processing", start_processing)
-    workflow.add_node("fetch_data", fetch_db_data)
-    workflow.add_node("memory", retrieve_memory_letta)
+    workflow.add_node("fetch_data",       fetch_db_data)
+    workflow.add_node("memory",           retrieve_memory_letta)
     workflow.add_node("retrieve_knowledge", retrieve_knowledge)
-    workflow.add_node("ai_writer", audit_and_write_pydantic)
-    workflow.add_node("critic", review_proposal)
-    workflow.add_node("save_db", save_to_supabase)
+    workflow.add_node("ai_writer",        audit_and_write_pydantic)
+    workflow.add_node("critic",           review_proposal)
+    workflow.add_node("save_db",          save_to_supabase)
     workflow.add_node("needs_optimization", mark_needs_optimization)
     workflow.add_node("publish_to_shopify", publish_to_shopify_node)
-    workflow.add_node("error_handler", error_handler)
+    workflow.add_node("error_handler",    error_handler)
 
+    # ─ Nodos nuevos: Orquestador Layer ───────────────────────────────────────────
+    workflow.add_node("enrich_for_orchestrator", fetch_db_data_orchestrator)
+    workflow.add_node("do_not_harm",     do_not_harm_check)
+    workflow.add_node("orchestrator",    orchestrator_node)
+    workflow.add_node("researcher",      researcher_node)
+
+    # ─ Entry point ───────────────────────────────────────────────────────────────
     workflow.set_entry_point("start_processing")
 
+    # ─ Flujo base (pre-orquestador) ────────────────────────────────────────────
     workflow.add_conditional_edges(
         "start_processing",
         route_after_start,
@@ -848,9 +1271,9 @@ def build_graph():
         "fetch_data",
         route_after_fetch,
         {
-            "memory": "memory",
+            "memory":           "memory",
             "publish_to_shopify": "publish_to_shopify",
-            "error_handler": "error_handler",
+            "error_handler":    "error_handler",
         },
     )
     workflow.add_conditional_edges(
@@ -861,17 +1284,47 @@ def build_graph():
     workflow.add_conditional_edges(
         "retrieve_knowledge",
         route_after_knowledge,
-        {"ai_writer": "ai_writer", "error_handler": "error_handler"},
+        # Ahora → enriquecer antes del writer (capa del orquestador)
+        {"ai_writer": "enrich_for_orchestrator", "error_handler": "error_handler"},
     )
+
+    # ─ Capa del Orquestador ─────────────────────────────────────────────────────
+    workflow.add_conditional_edges(
+        "enrich_for_orchestrator",
+        route_after_enrich,
+        {"do_not_harm": "do_not_harm", "error_handler": "error_handler"},
+    )
+    workflow.add_conditional_edges(
+        "do_not_harm",
+        route_after_do_not_harm,
+        {
+            "orchestrator":  "orchestrator",
+            "end":           END,
+            "error_handler": "error_handler",
+        },
+    )
+    workflow.add_conditional_edges(
+        "orchestrator",
+        route_after_orchestrator,
+        {
+            "researcher":    "researcher",
+            "ai_writer":     "ai_writer",
+            "error_handler": "error_handler",
+        },
+    )
+    # El Investigador siempre va al Redactor después
+    workflow.add_edge("researcher", "ai_writer")
+
+    # ─ Bucle de calidad (existente) ──────────────────────────────────────────────
     workflow.add_edge("ai_writer", "critic")
     workflow.add_conditional_edges(
         "critic",
         should_continue,
         {
-            "save_db": "save_db",
-            "ai_writer": "ai_writer",
+            "save_db":           "save_db",
+            "ai_writer":         "ai_writer",
             "needs_optimization": "needs_optimization",
-            "error_handler": "error_handler",
+            "error_handler":     "error_handler",
         },
     )
     workflow.add_conditional_edges(
@@ -879,8 +1332,8 @@ def build_graph():
         route_after_save,
         {
             "publish_to_shopify": "publish_to_shopify",
-            "error_handler": "error_handler",
-            "end": END,
+            "error_handler":      "error_handler",
+            "end":                END,
         },
     )
     workflow.add_conditional_edges(
@@ -899,3 +1352,4 @@ def build_graph():
 
 
 katalog_agent = build_graph()
+

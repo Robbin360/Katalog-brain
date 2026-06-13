@@ -1,0 +1,6 @@
+{
+  "name": "seo_technical",
+  "category": "seo",
+  "applicable_when": ["manufactured", "technical"],
+  "instruction": "El H2 debe contener la keyword principal del producto más su atributo técnico más diferenciador. Lista specs técnicas como bullets con valores exactos (voltaje, materiales, certificaciones). El título H2 y el primer párrafo deben mencionar la keyword para Google Shopping."
+}

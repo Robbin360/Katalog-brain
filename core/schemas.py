@@ -115,3 +115,79 @@ class ReclassificationResult(BaseModel):
     def to_supabase_dict(self) -> dict:
         """Return only distilled metadata; reasoning fields are excluded at field level."""
         return self.model_dump(exclude_none=True)
+
+
+# --- 3. ORQUESTADOR — Plan de Vuelo ---
+
+class OrchestratorPlan(BaseModel):
+    """Plan de vuelo generado por el Agente Orquestador."""
+
+    # EL DIAGNÓSTICO
+    diagnosis: str = Field(
+        ...,
+        description="Diagnóstico preciso del problema: precio, copy débil, "
+                    "specs faltantes, objeción no resuelta."
+    )
+    primary_problem: Literal[
+        "missing_specs",
+        "poor_copy",
+        "price_objection",
+        "no_persuasion",
+        "incomplete_data"
+    ]
+
+    # ACTIVACIÓN DE SUBAGENTES
+    activate_researcher_agent: bool = Field(
+        ...,
+        description="True SOLO si faltan especificaciones técnicas críticas "
+                    "que no están en Shopify ni en el caché."
+    )
+    research_instructions: Optional[str] = Field(
+        None,
+        description="Instrucciones exactas para el Investigador. "
+                    "Ej: 'Busca voltaje de aislamiento y certificación IEC'."
+    )
+
+    # INSTRUCCIONES A SUBAGENTES
+    copywriter_instructions: str = Field(
+        ...,
+        description="Estrategia quirúrgica y específica para el Redactor. "
+                    "Menciona el problema a resolver, el tono y el framework "
+                    "(FAB/PAS). NO instrucciones genéricas."
+    )
+    judge_instructions: str = Field(
+        ...,
+        description="Qué debe verificar el Juez específicamente: "
+                    "qué afirmaciones técnicas comprobar, si se resolvió la "
+                    "objeción de precio, qué NO debe aparecer en el copy."
+    )
+
+    # SKILLS A CARGAR
+    skills_to_inject: list[str] = Field(
+        ...,
+        description="Nombres de archivos .json en skills/ a cargar. "
+                    "Ej: ['ogilvy_price_anchoring', 'seo_technical']"
+    )
+
+    # CANDADO DE PROTECCIÓN
+    do_not_harm_triggered: bool = Field(default=False)
+    do_not_harm_reason: Optional[str] = None
+
+    # CLASIFICACIÓN DEL PRODUCTO
+    product_quadrant: str = Field(
+        ...,
+        description="NEEDS_OPTIMIZATION | STABLE_PERFORMING | MONITORING | "
+                    "BENCHMARK | INVESTIGATE_CAUSE"
+    )
+
+    # FACT-ANCHORED PRICING
+    fact_anchored_alert: bool = Field(
+        default=False,
+        description="True si el precio es alto (precio_relativo > 1.5) pero "
+                    "el dossier NO tiene materiales o garantías verificadas."
+    )
+    merchant_alert_message: Optional[str] = Field(
+        None,
+        description="Mensaje para el dashboard del comerciante explicando "
+                    "qué datos debe agregar para que la IA justifique el precio."
+    )

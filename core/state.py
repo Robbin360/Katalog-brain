@@ -1,30 +1,35 @@
 from typing import Any, NotRequired, Required, TypedDict
-from core.schemas import ProductContext, BrandRules, AIProposalOutput, CriticFeedback
+from core.schemas import ProductContext, BrandRules, AIProposalOutput, CriticFeedback, OrchestratorPlan
 
 class KatalogState(TypedDict, total=False):
     """
     La memoria a corto plazo (RAM) de la ejecución actual.
     Ahora con 'critic_feedback' e 'iterations' para soportar el bucle de calidad.
+
+    TIPOS DE DATOS SUPABASE (verificados via MCP pre-flight check):
+      shopify_products.id   → BIGINT → product_id es int en Python
+      shopify_products.user_id → UUID → user_id es str en Python
     """
-    product_id: Required[str]
+    # product_id es int porque shopify_products.id es BIGINT en Supabase
+    product_id: Required[int]
     user_id: NotRequired[str]
     auto_pilot_enabled: NotRequired[bool]
     current_status: NotRequired[str]
     retry_attempts: NotRequired[int]
     product_context: NotRequired[ProductContext]
     brand_rules: NotRequired[BrandRules]
-    
+
     # Memoria y Propuestas
     letta_memory: NotRequired[str]
     final_proposal: NotRequired[AIProposalOutput | dict[str, Any]]
 
     # RAG - Knowledge Base Retrieval
     rag_knowledge: NotRequired[list[dict[str, Any]]]
-    
+
     # 🛡️ CAPAS DE SEGURIDAD Y BUCLE DE CRÍTICA
-    critic_feedback: NotRequired[CriticFeedback | Any] # Aquí vive el veredicto del Juez
-    iterations: NotRequired[int]                       # Contador de seguridad (Max 3 intentos)
-    
+    critic_feedback: NotRequired[CriticFeedback | Any]  # Aquí vive el veredicto del Juez
+    iterations: NotRequired[int]                        # Contador de seguridad (Max 3 intentos)
+
     # Manejo de errores global
     error: NotRequired[str]
     status: NotRequired[str]
@@ -37,3 +42,33 @@ class KatalogState(TypedDict, total=False):
     # Taxonomía Predictiva de Shopify
     taxonomy_context: NotRequired[str]
     taxonomy_available: NotRequired[bool]
+
+    # ─── CAPA DEL ORQUESTADOR (NUEVOS CAMPOS) ────────────────────────────────
+    # Clasificación determinista del producto (sin LLM)
+    product_type_class: NotRequired[str]           # MANUFACTURED | ARTISANAL | GENERIC
+    product_quadrant: NotRequired[str]             # NEEDS_OPT | STABLE | MONITORING | BENCHMARK | INVESTIGATE_CAUSE
+    precio_relativo: NotRequired[float]            # precio / avg_precio_nicho
+    seo_score_raw: NotRequired[int]                # 0-100 (de shopify_products.seo_score_initial)
+    seo_score_category: NotRequired[str]           # POOR | ACCEPTABLE | GOOD | EXCELLENT
+    cached_specs: NotRequired[dict | None]         # specs del caché product_enrichment
+    data_gaps: NotRequired[list[str]]              # gaps detectados (para el Investigador)
+    available_skills: NotRequired[list[str]]       # nombres de skills disponibles
+    fingerprint: NotRequired[str]                  # SHA-256 del producto base
+
+    # Plan de vuelo del Orquestador
+    orchestrator_plan: NotRequired[OrchestratorPlan | None]
+
+    # Resultado del Investigador (si fue activado)
+    research_result: NotRequired[Any | None]       # ResearchResult de researcher_agent
+
+    # Skills pre-cargadas (instrucciones concatenadas para el Redactor)
+    loaded_skills: NotRequired[str]
+
+    # Estado de monitoreo
+    monitoring_since: NotRequired[str | None]      # ISO timestamp (TIMESTAMPTZ en DB)
+
+    # Producto raw de Shopify (dict con todos los campos de shopify_products)
+    product: NotRequired[dict[str, Any]]
+
+    # Métricas de ventas (de product_metrics)
+    metrics: NotRequired[dict[str, Any]]

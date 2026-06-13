@@ -1,0 +1,6 @@
+{
+  "name": "ogilvy_price_anchoring",
+  "category": "pricing",
+  "applicable_when": ["high_ticket", "manufactured"],
+  "instruction": "No justifiques el precio directamente. Muestra el valor acumulado en el tiempo: cuánto cuesta NO tener este producto, cuánto ahorra en el largo plazo, cuántas veces pagará el precio en valor recibido. El comprador debe sentir que es una inversión, no un gasto."
+}

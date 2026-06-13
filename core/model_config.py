@@ -16,3 +16,6 @@ CRITIC_FALLBACK_MODEL = os.getenv("CRITIC_FALLBACK_MODEL", "groq:openai/gpt-oss-
 
 RECLASSIFIER_PRIMARY_MODEL = os.getenv("RECLASSIFIER_PRIMARY_MODEL", "deepseek/deepseek-v4-flash:free")
 RECLASSIFIER_FALLBACK_MODEL = os.getenv("RECLASSIFIER_FALLBACK_MODEL", "groq:qwen/qwen3-32b")
+
+# Motor ultrarrápido para el Agente Investigador (Tavily/Firecrawl)
+RESEARCHER_MODEL = os.getenv("RESEARCHER_MODEL", "google:gemini-3.5-flash")

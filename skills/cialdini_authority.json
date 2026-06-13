@@ -1,0 +1,6 @@
+{
+  "name": "cialdini_authority",
+  "category": "trust",
+  "applicable_when": ["high_ticket", "any"],
+  "instruction": "Menciona certificaciones, marcas reconocidas, años de garantía o estándares industriales para construir autoridad. No inventes certificaciones — usa SOLO las que están en el dossier verificado del producto."
+}
