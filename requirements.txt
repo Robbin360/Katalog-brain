@@ -4,6 +4,7 @@
 fastapi==0.121.0
 uvicorn[standard]==0.38.0
 langgraph==1.1.9
+langsmith==0.8.5
 pydantic==2.12.3
 pydantic-ai-slim[google,groq]==1.87.0
 google-genai==1.66.0

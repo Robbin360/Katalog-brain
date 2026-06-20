@@ -49,6 +49,8 @@ QUADRANT_INVESTIGATE    = "INVESTIGATE_CAUSE"
 
 _SKIP_QUADRANTS = {QUADRANT_STABLE, QUADRANT_MONITORING, QUADRANT_BENCHMARK, QUADRANT_INVESTIGATE}
 
+BILLING_BASE_CREDITS = 1  # único costo por producto, Investigador incluido (modelo flat)
+
 
 async def _run_sync(callable_obj):
     return await asyncio.to_thread(callable_obj)
@@ -253,19 +255,47 @@ async def mark_product_error(
         print(f"❌ [Supabase] No se pudo registrar ERROR para producto {product_id}: {e}")
 
 
-async def charge_profile_credit(user_id: str) -> bool:
+async def _refund_reservation(state: KatalogState, reason: str) -> None:
+    """Reembolsa la reserva cuando no se generó valor (fallo temprano o skip do-not-harm)."""
+    reservation_id = state.get("reservation_id")
+    user_id = state.get("user_id")
+    product_id = state.get("product_id")
+    if not reservation_id or not user_id or product_id is None:
+        return
     try:
         await _run_sync(
-            lambda: supabase.rpc(
-                "increment_profile_credits_used",
-                {"p_user_id": user_id},
-            ).execute()
+            lambda: supabase.rpc("refund_product_reservation", {
+                "p_user_id": user_id,
+                "p_product_id": int(product_id),
+                "p_reservation_id": reservation_id,
+            }).execute()
         )
-        print(f"💳 [Créditos] Crédito consumido para usuario {user_id}.")
-        return True
+        print(f"↩️ [Billing] Reserva reembolsada para producto {product_id} ({reason}).")
     except Exception as e:
-        print(f"❌ [Créditos] Error al cobrar crédito al usuario {user_id}: {e}")
-        return False
+        print(f"⚠️ [Billing] Error reembolsando reserva ({reason}): {e}")
+
+
+async def _commit_reservation(state: KatalogState, reason: str) -> dict[str, Any] | None:
+    """Confirma el cobro de la reserva (idempotente — seguro de llamar más de una vez)."""
+    reservation_id = state.get("reservation_id")
+    user_id = state.get("user_id")
+    product_id = state.get("product_id")
+    if not reservation_id or not user_id or product_id is None:
+        return None
+    try:
+        commit_res = await _run_sync(
+            lambda: supabase.rpc("commit_product_credit", {
+                "p_user_id": user_id,
+                "p_product_id": int(product_id),
+                "p_reservation_id": reservation_id,
+            }).execute()
+        )
+        row = (commit_res.data or [{}])[0]
+        print(f"💳 [Billing] Crédito comprometido ({reason}): {row}")
+        return row
+    except Exception as e:
+        print(f"⚠️ [Billing] Error comprometiendo crédito ({reason}): {e}")
+        return None
 
 
 # ==========================================
@@ -278,15 +308,55 @@ async def start_processing(state: KatalogState) -> dict[str, Any]:
     try:
         current = await _run_sync(
             lambda: supabase.table("shopify_products")
-            .select("audit_status")
+            .select("audit_status, user_id, billing_state, reservation_id, credits_reserved")
             .eq("id", product_id)
             .single()
             .execute()
         )
-        current_status = (current.data or {}).get("audit_status")
+        row = current.data or {}
+        current_status = row.get("audit_status")
+        user_id = row.get("user_id")
+
         if current_status == STATUS_OPTIMIZED:
             print(f"⛔ [Nodo 0] Producto {product_id} ya está {current_status}. Abortando para evitar amnesia de estado.")
             return {"error": f"Producto ya está {current_status}. No se puede re-procesar."}
+
+        if not user_id:
+            return {"error": f"Producto {product_id} no tiene user_id asociado."}
+
+        billing_state = row.get("billing_state")
+        if billing_state == "RESERVED" and row.get("reservation_id"):
+            reservation_id = row["reservation_id"]
+            credits_reserved = _to_int(row.get("credits_reserved")) or BILLING_BASE_CREDITS
+            print(f"♻️ [Billing] Reutilizando reserva {reservation_id} ({credits_reserved} créditos).")
+        else:
+            reserve_res = await _run_sync(
+                lambda: supabase.rpc("reserve_or_reuse_product_credit", {
+                    "p_user_id": user_id,
+                    "p_product_id": int(product_id),
+                    "p_base_amount": BILLING_BASE_CREDITS,
+                }).execute()
+            )
+            reserve_row = (reserve_res.data or [{}])[0]
+
+            if not reserve_row.get("success"):
+                reason = reserve_row.get("reason", "insufficient_credits")
+
+                if reason == "insufficient_credits":
+                    await _run_sync(lambda: supabase.table("shopify_products").update({
+                        "audit_status": "OUT_OF_CREDITS",
+                        "error_log": "Créditos insuficientes para optimizar este producto.",
+                        "updated_at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    }).eq("id", product_id).execute())
+                    print(f"💳 [Billing] Producto {product_id} → OUT_OF_CREDITS.")
+                    return {"out_of_credits": True, "error": None}
+
+                print(f"💳 [Billing] Reserva rechazada para producto {product_id}: {reason}")
+                return {"error": f"No se pudo reservar crédito ({reason})."}
+
+            reservation_id = reserve_row["reservation_id"]
+            credits_reserved = reserve_row["credits_reserved"]
+            print(f"💳 [Billing] Crédito(s) reservado(s): {credits_reserved} (reservation_id={reservation_id})")
 
         await _run_sync(lambda: supabase.table("shopify_products").update({
             "audit_status": STATUS_PROCESSING,
@@ -297,6 +367,11 @@ async def start_processing(state: KatalogState) -> dict[str, Any]:
         return {
             "auto_pilot_enabled": state.get("auto_pilot_enabled", False),
             "current_status": state.get("current_status") or current_status,
+            "user_id": str(user_id),
+            "reservation_id": str(reservation_id),
+            "credits_reserved": _to_int(credits_reserved),
+            "writer_invoked": False,
+            "out_of_credits": False,
             "error": None,
         }
     except Exception as e:
@@ -577,11 +652,11 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     try:
         result = await run_optimizer_with_fallback(prompt)
         final_data = getattr(result, "data", getattr(result, "output", result))
-        return {"final_proposal": final_data}
+        return {"final_proposal": final_data, "writer_invoked": True}
     except Exception as e:
         error_message = _format_error_for_log(e)
         print(f"\u274c [Nodo 3] Error de IA: {error_message}")
-        return {"error": error_message}
+        return {"error": error_message, "writer_invoked": True}
 
 
 # ==========================================
@@ -704,23 +779,12 @@ async def fetch_db_data_orchestrator(state: KatalogState) -> dict[str, Any]:
 # \U0001f6ab NODO: DO-NOT-HARM (CANDADO PYTHON PURO)
 # ==========================================
 async def do_not_harm_check(state: KatalogState) -> dict[str, Any]:
-    """
-    Candado de protección determinista — NUNCA delega al LLM.
-    Clasifica el producto en uno de 5 cuadrantes y decide si optimizar.
-
-    Usa columnas reales de shopify_products:
-      sales_last_7_days  → INTEGER
-      sales_last_30_days → INTEGER
-      sales_last_90_days → INTEGER
-    """
     if state.get("error"):
         return {}
 
-    # product_id es BIGINT → int
     product_id = int(state["product_id"])
     product    = state.get("product", {})
 
-    # Leer ventas directamente desde el dict del producto (ya cargado)
     sales_7d  = int(product.get("sales_last_7_days",  0) or 0)
     sales_30d = int(product.get("sales_last_30_days", 0) or 0)
     sales_90d = int(product.get("sales_last_90_days", 0) or 0)
@@ -734,64 +798,53 @@ async def do_not_harm_check(state: KatalogState) -> dict[str, Any]:
     is_good_copy     = seo_score_raw >= 70
 
     async def _update_status(update: dict) -> None:
-        """Helper: actualiza shopify_products con product_id BIGINT."""
         await _run_sync(
-            lambda: supabase.table("shopify_products")
-            .update(update)
-            .eq("id", product_id)
-            .execute()
+            lambda: supabase.table("shopify_products").update(update).eq("id", product_id).execute()
         )
 
-    # STABLE PERFORMING — vende consistentemente aunque el copy sea malo
     if is_consistent and is_poor_copy and not is_viral_spike:
         await _update_status({"audit_status": QUADRANT_STABLE})
-        print(f"\U0001f6ab [Do-Not-Harm] {product_id} → STABLE_PERFORMING (avg_weekly={avg_weekly:.1f})")
+        await _refund_reservation(state, "do_not_harm:STABLE_PERFORMING")
+        print(f"🚫 [Do-Not-Harm] {product_id} → STABLE_PERFORMING (avg_weekly={avg_weekly:.1f})")
         return {"product_quadrant": QUADRANT_STABLE}
 
-    # MONITORING — pico viral, esperar 2 semanas antes de tocar
     if is_viral_spike:
         monitoring_since_str = product.get("monitoring_since")
 
         if monitoring_since_str:
             try:
-                monitoring_since = datetime.fromisoformat(
-                    monitoring_since_str.replace("Z", "+00:00")
-                )
+                monitoring_since = datetime.fromisoformat(monitoring_since_str.replace("Z", "+00:00"))
                 weeks_elapsed = (datetime.now(timezone.utc) - monitoring_since).days / 7
             except (ValueError, TypeError):
                 weeks_elapsed = 0.0
 
             if weeks_elapsed >= 2:
-                # Pico terminó — limpiar y continuar al análisis normal
                 await _update_status({"monitoring_since": None})
-                print(f"\u23f0 [Do-Not-Harm] {product_id}: pico terminó, optimizando")
+                print(f"⏰ [Do-Not-Harm] {product_id}: pico terminó, optimizando")
             else:
-                print(f"\U0001f4ca [Do-Not-Harm] {product_id} → MONITORING ({weeks_elapsed:.1f} semanas)")
+                await _refund_reservation(state, "do_not_harm:MONITORING")
+                print(f"📊 [Do-Not-Harm] {product_id} → MONITORING ({weeks_elapsed:.1f} semanas)")
                 return {"product_quadrant": QUADRANT_MONITORING}
         else:
-            # Primera vez en MONITORING
             now_iso = datetime.now(timezone.utc).isoformat()
-            await _update_status({
-                "audit_status": QUADRANT_MONITORING,
-                "monitoring_since": now_iso,
-            })
-            print(f"\U0001f4ca [Do-Not-Harm] {product_id} → MONITORING (inicio)")
+            await _update_status({"audit_status": QUADRANT_MONITORING, "monitoring_since": now_iso})
+            await _refund_reservation(state, "do_not_harm:MONITORING_START")
+            print(f"📊 [Do-Not-Harm] {product_id} → MONITORING (inicio)")
             return {"product_quadrant": QUADRANT_MONITORING}
 
-    # BENCHMARK — vende bien con copy excelente
     if is_consistent and is_good_copy:
         await _update_status({"audit_status": QUADRANT_BENCHMARK})
-        print(f"\U0001f3c6 [Do-Not-Harm] {product_id} → BENCHMARK")
+        await _refund_reservation(state, "do_not_harm:BENCHMARK")
+        print(f"🏆 [Do-Not-Harm] {product_id} → BENCHMARK")
         return {"product_quadrant": QUADRANT_BENCHMARK}
 
-    # INVESTIGATE CAUSE — copy bueno pero no vende
     if is_dead and is_good_copy:
         await _update_status({"audit_status": QUADRANT_INVESTIGATE})
-        print(f"\U0001f50d [Do-Not-Harm] {product_id} → INVESTIGATE_CAUSE")
+        await _refund_reservation(state, "do_not_harm:INVESTIGATE_CAUSE")
+        print(f"🔍 [Do-Not-Harm] {product_id} → INVESTIGATE_CAUSE")
         return {"product_quadrant": QUADRANT_INVESTIGATE}
 
-    # NEEDS OPTIMIZATION — herida abierta, optimizar
-    print(f"\U0001f3af [Do-Not-Harm] {product_id} → NEEDS_OPTIMIZATION")
+    print(f"🎯 [Do-Not-Harm] {product_id} → NEEDS_OPTIMIZATION")
     return {"product_quadrant": QUADRANT_NEEDS_OPT}
 
 
@@ -1003,17 +1056,11 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
             "next_retry_at": None,
         }).eq("id", state["product_id"]).execute())
 
-        print("✅ [Nodo 5] Producto marcado como READY_TO_PUBLISH.")
-        if not state.get("auto_pilot_enabled", False):
-            user_id = state.get("user_id")
-            if user_id:
-                await _run_sync(
-                    lambda: supabase.rpc("increment_profile_credits_used", {"p_user_id": user_id}).execute()
-                )
-                print(f"💳 [Créditos] Crédito consumido para usuario {user_id} (READY_TO_PUBLISH).")
-            else:
-                print("⚠️ [Créditos] No se cobró crédito: user_id ausente.")
+        # ✅ Único punto de cobro en el camino exitoso: el LLM ya trabajó y
+        # el Juez ya aprobó. Publicar después (ahora o en una semana) es gratis.
+        await _commit_reservation(state, "optimization_complete")
 
+        print("✅ [Nodo 5] Propuesta guardada y crédito comprometido.")
         return {"status": STATUS_READY_TO_PUBLISH, "retry_attempts": 0}
     except Exception as e:
         error_message = _format_error_for_log(e)
@@ -1049,6 +1096,10 @@ async def mark_needs_optimization(state: KatalogState) -> dict[str, Any]:
             .eq("id", product_id)
             .execute()
         )
+
+        # El Escritor y el Juez ya gastaron API real — se comete el crédito reservado.
+        await _commit_reservation(state, "needs_optimization")
+
         print(f"🟠 [Nodo 5B] Producto {product_id} marcado como NEEDS_OPTIMIZATION.")
         return {"status": STATUS_NEEDS_OPTIMIZATION}
     except Exception as e:
@@ -1126,10 +1177,7 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
             "status": "published",
         }).execute())
 
-        await _run_sync(
-            lambda: supabase.rpc("increment_profile_credits_used", {"p_user_id": user_id}).execute()
-        )
-        print(f"💳 [Créditos] Crédito consumido para usuario {user_id} (OPTIMIZED).")
+        # ✅ Sin lógica de créditos aquí. El cobro ya ocurrió en save_to_supabase.
         print(f"✅ [Nodo 6] Producto {product_id} publicado y marcado como OPTIMIZED.")
         return {"status": STATUS_OPTIMIZED, "retry_attempts": 0}
     except Exception as e:
@@ -1142,7 +1190,6 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
 # 🧯 NODO GLOBAL DE ERROR
 # ==========================================
 async def error_handler(state: KatalogState) -> dict[str, Any]:
-    # product_id es BIGINT (int) en DB — usamos str() solo para display
     product_id = state["product_id"]
     fallback_message = (
         "El Juez no devolvió feedback legible."
@@ -1151,6 +1198,33 @@ async def error_handler(state: KatalogState) -> dict[str, Any]:
     )
     error_message = str(state.get("error") or fallback_message)
     print(f"🧯 [Error Handler] Marcando producto {product_id} como ERROR: {error_message}")
+
+    user_id = state.get("user_id")
+    reservation_id = state.get("reservation_id")
+    writer_invoked = bool(state.get("writer_invoked"))
+
+    if reservation_id and user_id:
+        try:
+            if writer_invoked:
+                await _commit_reservation(state, "late_failure")
+            else:
+                await _refund_reservation(state, "early_failure")
+        except Exception as billing_error:
+            print(f"⚠️ [Billing] Error ajustando créditos tras fallo: {billing_error}")
+
+        try:
+            fail_res = await _run_sync(
+                lambda: supabase.rpc("record_product_failure_and_maybe_compensate", {
+                    "p_user_id": user_id,
+                    "p_product_id": int(product_id),
+                }).execute()
+            )
+            fail_row = (fail_res.data or [{}])[0]
+            if fail_row.get("compensation_granted"):
+                print(f"🎁 [Billing] Compensación automática otorgada a usuario {user_id}.")
+        except Exception as e:
+            print(f"⚠️ [Billing] Error registrando fallo consecutivo: {e}")
+
     await mark_product_error(product_id, error_message, state)
     return {"status": STATUS_ERROR}
 
@@ -1159,6 +1233,8 @@ async def error_handler(state: KatalogState) -> dict[str, Any]:
 # ─── ENRUTADORES ORIGINALES (flujo base) ─────────────────────────────────────
 
 def route_after_start(state: KatalogState) -> str:
+    if state.get("out_of_credits"):
+        return "end"
     return "error_handler" if state.get("error") else "fetch_data"
 
 
@@ -1265,7 +1341,7 @@ def build_graph():
     workflow.add_conditional_edges(
         "start_processing",
         route_after_start,
-        {"fetch_data": "fetch_data", "error_handler": "error_handler"},
+        {"fetch_data": "fetch_data", "error_handler": "error_handler", "end": END},
     )
     workflow.add_conditional_edges(
         "fetch_data",

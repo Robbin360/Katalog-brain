@@ -154,7 +154,7 @@ async def auto_pilot_patrol() -> None:
             # Buscar productos atascados en PROCESSING
             zombie_res = await _run_sync(
                 lambda: supabase.table("shopify_products")
-                .select("id,retry_attempts")
+                .select("id,retry_attempts,user_id,billing_state,reservation_id")
                 .eq("audit_status", STATUS_PROCESSING)
                 .lt("updated_at", zombie_timeout)
                 .execute()
@@ -182,6 +182,26 @@ async def auto_pilot_patrol() -> None:
                         .execute()
                     )
                     print(f"🔎 [DEBUG] Update resultado para ID {zombie_id}: {update_res.data}")
+
+                    # 💳 Si el zombie aún tenía una reserva viva (nunca llegó al commit),
+                    # liberamos el crédito atrapado. Si ya estaba COMMITTED, no se toca.
+                    billing_state = zombie.get("billing_state")
+                    reservation_id = zombie.get("reservation_id")
+                    user_id = zombie.get("user_id")
+                    if billing_state == "RESERVED" and reservation_id and user_id:
+                        try:
+                            await _run_sync(
+                                lambda uid=user_id, zid=zombie_id, rid=reservation_id: supabase.rpc(
+                                    "refund_product_reservation", {
+                                        "p_user_id": uid,
+                                        "p_product_id": zid,
+                                        "p_reservation_id": rid,
+                                    }
+                                ).execute()
+                            )
+                            print(f"↩️ [Zombie Sweeper] Crédito reembolsado para producto {zombie_id}.")
+                        except Exception as refund_error:
+                            print(f"⚠️ [Zombie Sweeper] Error reembolsando crédito de {zombie_id}: {refund_error}")
                 print(f"🧟 [Zombie Sweeper] {len(zombies)} zombies devueltos a la cola de errores.")
         except Exception as sweeper_error:
             print(f"⚠️ [Zombie Sweeper] Error durante la fase de recuperación: {sweeper_error}")
@@ -249,17 +269,18 @@ async def auto_pilot_patrol() -> None:
         try:
             profiles_res = await _run_sync(
                 lambda: supabase.table("profiles")
-                .select("id,auto_pilot_enabled,credits_used,credits_total")
+                .select("id,auto_pilot_enabled,credits_used,credits_total,credits_reserved")
                 .eq("auto_pilot_enabled", True)
                 .execute()
             )
             all_enabled_profiles: list[dict[str, Any]] = profiles_res.data or []
             
-            # Filtrar perfiles con créditos disponibles
+            # Filtrar perfiles con créditos disponibles (restando lo ya reservado)
             for profile in all_enabled_profiles:
                 credits_used = _to_int(profile.get("credits_used"))
                 credits_total = _to_int(profile.get("credits_total"))
-                if credits_total - credits_used > 0:
+                credits_reserved = _to_int(profile.get("credits_reserved"))
+                if credits_total - credits_used - credits_reserved > 0:
                     profiles.append(profile)
                     
             if not profiles:
@@ -281,7 +302,8 @@ async def auto_pilot_patrol() -> None:
                 try:
                     credits_used = _to_int(profile.get("credits_used"))
                     credits_total = _to_int(profile.get("credits_total"))
-                    credits_remaining = max(credits_total - credits_used, 0)
+                    credits_reserved = _to_int(profile.get("credits_reserved"))
+                    credits_remaining = max(credits_total - credits_used - credits_reserved, 0)
                     
                     if credits_remaining <= 0:
                         continue
@@ -292,6 +314,7 @@ async def auto_pilot_patrol() -> None:
                     eligible_filter = (
                         f"and(audit_status.eq.NEEDS_OPTIMIZATION,retry_attempts.lt.3,or(next_retry_at.lte.{current_iso_time},next_retry_at.is.null)),"
                         f"audit_status.eq.READY_TO_PUBLISH,"
+                        f"audit_status.eq.OUT_OF_CREDITS,"
                         f"and(audit_status.eq.ERROR,retry_attempts.lt.3,or(next_retry_at.lte.{current_iso_time},next_retry_at.is.null))"
                     )
                     

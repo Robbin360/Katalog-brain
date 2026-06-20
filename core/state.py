@@ -30,6 +30,12 @@ class KatalogState(TypedDict, total=False):
     critic_feedback: NotRequired[CriticFeedback | Any]  # Aquí vive el veredicto del Juez
     iterations: NotRequired[int]                        # Contador de seguridad (Max 3 intentos)
 
+    # ─── RESERVE → COMMIT (BILLING) ──────────────────────────────────────────
+    reservation_id: NotRequired[str]       # UUID de la reserva activa en Supabase
+    credits_reserved: NotRequired[int]     # Créditos reservados (siempre 1 en el modelo actual)
+    writer_invoked: NotRequired[bool]      # True una vez que ai_writer corrió al menos una vez
+    out_of_credits: NotRequired[bool]      # True si start_processing detectó falta de créditos
+
     # Manejo de errores global
     error: NotRequired[str]
     status: NotRequired[str]
