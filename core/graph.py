@@ -325,8 +325,19 @@ async def start_processing(state: KatalogState) -> dict[str, Any]:
             return {"error": f"Producto {product_id} no tiene user_id asociado."}
 
         billing_state = row.get("billing_state")
-        if billing_state == "RESERVED" and row.get("reservation_id"):
-            reservation_id = row["reservation_id"]
+        existing_reservation_id = row.get("reservation_id")
+        reused_committed = False
+
+        if billing_state == "COMMITTED" and existing_reservation_id:
+            # Producto ya cobrado en una ejecución anterior del grafo (retry de
+            # NEEDS_OPTIMIZATION/ERROR tardío, o fast-track republicando un
+            # READY_TO_PUBLISH ya pagado). NO reservar de nuevo — ya se pagó por esto.
+            reservation_id = existing_reservation_id
+            credits_reserved = _to_int(row.get("credits_reserved")) or BILLING_BASE_CREDITS
+            reused_committed = True
+            print(f"✅ [Billing] Producto {product_id} ya está COMMITTED (reservation_id={reservation_id}). Sin nueva reserva.")
+        elif billing_state == "RESERVED" and existing_reservation_id:
+            reservation_id = existing_reservation_id
             credits_reserved = _to_int(row.get("credits_reserved")) or BILLING_BASE_CREDITS
             print(f"♻️ [Billing] Reutilizando reserva {reservation_id} ({credits_reserved} créditos).")
         else:
@@ -370,7 +381,7 @@ async def start_processing(state: KatalogState) -> dict[str, Any]:
             "user_id": str(user_id),
             "reservation_id": str(reservation_id),
             "credits_reserved": _to_int(credits_reserved),
-            "writer_invoked": False,
+            "writer_invoked": reused_committed,
             "out_of_credits": False,
             "error": None,
         }
