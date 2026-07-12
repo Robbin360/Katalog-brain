@@ -237,13 +237,16 @@ async def trigger_shopify_sync(
         except Exception as e:
             print(f"❌ [Sync API] Sync failed for user {request.user_id}: {e}")
             try:
-                res = supabase.table("sync_jobs")\
-                    .select("id")\
-                    .eq("user_id", request.user_id)\
-                    .eq("status", "syncing")\
-                    .order("created_at", desc=True)\
-                    .limit(1)\
-                    .execute()
+                def _find_syncing_job():
+                    return supabase.table("sync_jobs")\
+                        .select("id")\
+                        .eq("user_id", request.user_id)\
+                        .eq("status", "syncing")\
+                        .order("created_at", desc=True)\
+                        .limit(1)\
+                        .execute()
+
+                res = await asyncio.to_thread(_find_syncing_job)
                 if res.data:
                     job_id = res.data[0]["id"]
                     from core.shopify_api import fail_sync_job
