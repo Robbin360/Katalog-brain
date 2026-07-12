@@ -255,32 +255,44 @@ async def handle_throttle(throttle_status: dict):
 async def update_sync_cursor(job_id: str, cursor: str, products_synced: int):
     """Guarda el cursor y el progreso después de cada página."""
     from core.graph import supabase
-    supabase.table("sync_jobs").update({
-        "last_sync_cursor": cursor,
-        "products_synced": products_synced,
-        "status": "syncing"
-    }).eq("id", job_id).execute()
+    
+    def _update():
+        supabase.table("sync_jobs").update({
+            "last_sync_cursor": cursor,
+            "products_synced": products_synced,
+            "status": "syncing"
+        }).eq("id", job_id).execute()
+    
+    await asyncio.to_thread(_update)
 
 
 async def complete_sync_job(job_id: str, products_synced: int):
     """Marca el sync como completo y limpia el cursor."""
     from core.graph import supabase
-    supabase.table("sync_jobs").update({
-        "status": "completed",
-        "products_synced": products_synced,
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-        "last_sync_cursor": None
-    }).eq("id", job_id).execute()
+    
+    def _update():
+        supabase.table("sync_jobs").update({
+            "status": "completed",
+            "products_synced": products_synced,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "last_sync_cursor": None
+        }).eq("id", job_id).execute()
+    
+    await asyncio.to_thread(_update)
 
 
 async def fail_sync_job(job_id: str, error_message: str):
     """Marca el sync como fallido."""
     from core.graph import supabase
-    supabase.table("sync_jobs").update({
-        "status": "failed",
-        "error_message": error_message,
-        "completed_at": datetime.now(timezone.utc).isoformat()
-    }).eq("id", job_id).execute()
+    
+    def _update():
+        supabase.table("sync_jobs").update({
+            "status": "failed",
+            "error_message": error_message,
+            "completed_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", job_id).execute()
+    
+    await asyncio.to_thread(_update)
 
 
 async def fetch_all_products(shop_url: str, access_token: str, job_id: str, last_cursor: str = None):
@@ -400,10 +412,14 @@ async def save_products_to_db(products: list, user_id: str):
     batch_size = 100
     for i in range(0, len(records), batch_size):
         batch = records[i:i + batch_size]
-        supabase.table("shopify_products").upsert(
-            batch,
-            on_conflict="shopify_id,user_id"
-        ).execute()
+        
+        def _upsert(b=batch):
+            supabase.table("shopify_products").upsert(
+                b,
+                on_conflict="shopify_id,user_id"
+            ).execute()
+        
+        await asyncio.to_thread(_upsert)
 
 
 async def sync_shopify_products(user_id: str, shop_url: str, access_token: str):
@@ -411,13 +427,16 @@ async def sync_shopify_products(user_id: str, shop_url: str, access_token: str):
     from core.graph import supabase
     
     # 1. Buscar si hay un sync_job en progreso (para resume)
-    result = supabase.table("sync_jobs")\
-        .select("*")\
-        .eq("user_id", user_id)\
-        .eq("status", "syncing")\
-        .order("created_at", desc=True)\
-        .limit(1)\
-        .execute()
+    def _find_prev_job():
+        return supabase.table("sync_jobs")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .eq("status", "syncing")\
+            .order("created_at", desc=True)\
+            .limit(1)\
+            .execute()
+    
+    result = await asyncio.to_thread(_find_prev_job)
     
     if result.data:
         # Hay un sync interrumpido — continuar desde el cursor
@@ -440,12 +459,15 @@ async def sync_shopify_products(user_id: str, shop_url: str, access_token: str):
             print(f"⚠️ Could not fetch productsCount: {count_err}")
             
         # No hay sync en progreso — crear nuevo job
-        job_result = supabase.table("sync_jobs").insert({
-            "user_id": user_id,
-            "status": "syncing",
-            "products_total": products_total,
-            "started_at": datetime.now(timezone.utc).isoformat()
-        }).execute()
+        def _create_job():
+            return supabase.table("sync_jobs").insert({
+                "user_id": user_id,
+                "status": "syncing",
+                "products_total": products_total,
+                "started_at": datetime.now(timezone.utc).isoformat()
+            }).execute()
+        
+        job_result = await asyncio.to_thread(_create_job)
         job_id = job_result.data[0]["id"]
         print("Starting fresh sync")
         products = await fetch_all_products(shop_url, access_token, job_id, last_cursor=None)
