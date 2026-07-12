@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 from typing import Any
 import httpx
 
@@ -206,9 +207,253 @@ async def get_product_taxonomy(
 
         except Exception as attr_err:
             print(f"⚠️ [shopify_api] Error recuperando atributos de categoría: {attr_err}")
-            # Retornar al menos la categoría principal en vez de fallar del todo
+             # Retornar al menos la categoría principal en vez de fallar del todo
             return (f"Categoría Shopify: \"{category_fullname}\"", True)
 
     except Exception as e:
         print(f"❌ [shopify_api] Error en get_product_taxonomy: {e}")
         return ("", False)
+
+
+# --- SHOPIFY PAGINATION + THROTTLE + RESUME + UPSERT (FIX 16) ---
+
+async def shopify_graphql_request(shop_url: str, access_token: str, query: str, variables: dict = None) -> dict:
+    """Realiza una petición GraphQL a la API Admin de Shopify."""
+    normalized_shop_url = _normalize_shop_url(shop_url)
+    endpoint = f"https://{normalized_shop_url}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        response = await client.post(
+            endpoint,
+            json={"query": query, "variables": variables or {}},
+            headers=headers
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+async def handle_throttle(throttle_status: dict):
+    """Pausa si estamos cerca del rate limit de Shopify."""
+    if not throttle_status:
+        return
+    
+    currently_available = throttle_status.get("currentlyAvailable", 1000)
+    restore_rate = throttle_status.get("restoreRate", 50)
+    
+    # Si nos quedan menos de 250 puntos (costo de la próxima query), esperar
+    if currently_available < 250:
+        points_needed = 250 - currently_available
+        wait_seconds = points_needed / max(restore_rate, 1)
+        wait_seconds = wait_seconds * 1.1  # 10% margen
+        print(f"⏳ [Throttle] Waiting {wait_seconds:.2f} seconds for Shopify rate limit points to restore.")
+        await asyncio.sleep(min(wait_seconds, 10))  # Máximo 10s de espera
+
+
+async def update_sync_cursor(job_id: str, cursor: str, products_synced: int):
+    """Guarda el cursor y el progreso después de cada página."""
+    from core.graph import supabase
+    supabase.table("sync_jobs").update({
+        "last_sync_cursor": cursor,
+        "products_synced": products_synced,
+        "status": "syncing"
+    }).eq("id", job_id).execute()
+
+
+async def complete_sync_job(job_id: str, products_synced: int):
+    """Marca el sync como completo y limpia el cursor."""
+    from core.graph import supabase
+    supabase.table("sync_jobs").update({
+        "status": "completed",
+        "products_synced": products_synced,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "last_sync_cursor": None
+    }).eq("id", job_id).execute()
+
+
+async def fail_sync_job(job_id: str, error_message: str):
+    """Marca el sync como fallido."""
+    from core.graph import supabase
+    supabase.table("sync_jobs").update({
+        "status": "failed",
+        "error_message": error_message,
+        "completed_at": datetime.now(timezone.utc).isoformat()
+    }).eq("id", job_id).execute()
+
+
+async def fetch_all_products(shop_url: str, access_token: str, job_id: str, last_cursor: str = None):
+    """Trae TODOS los productos de una tienda Shopify usando cursor-based pagination y actualiza el job."""
+    all_products = []
+    cursor = last_cursor  # None si es sync desde cero, o el último cursor guardado si es resume
+    has_next = True
+    
+    while has_next:
+        query = """
+        query getProducts($first: Int!, $after: String) {
+          products(first: $first, after: $after) {
+            edges {
+              node {
+                id
+                title
+                descriptionHtml
+                seo {
+                  title
+                  description
+                }
+                status
+                vendor
+                productType
+                tags
+                featuredImage {
+                  url
+                }
+                variants(first: 10) {
+                  edges {
+                    node {
+                      id
+                      sku
+                      price
+                      inventoryQuantity
+                    }
+                  }
+                }
+              }
+              cursor
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+        
+        variables = {
+            "first": 250,
+            "after": cursor
+        }
+        
+        response = await shopify_graphql_request(
+            shop_url, 
+            access_token, 
+            query, 
+            variables
+        )
+        
+        if "errors" in response and response["errors"]:
+            raise RuntimeError(f"Shopify GraphQL Error: {response['errors'][0].get('message')}")
+            
+        products_page = response["data"]["products"]["edges"]
+        page_info = response["data"]["products"]["pageInfo"]
+        
+        for edge in products_page:
+            product = edge["node"]
+            all_products.append(product)
+        
+        # Actualizar cursor
+        cursor = page_info["endCursor"]
+        has_next = page_info["hasNextPage"]
+        
+        # Guardar el cursor en sync_jobs después de CADA página (para resume)
+        await update_sync_cursor(job_id, cursor, len(all_products))
+        
+        # Throttle: leer el costo de la query del response y pacear
+        throttle_status = response.get("extensions", {}).get("cost", {}).get("throttleStatus", {})
+        await handle_throttle(throttle_status)
+    
+    return all_products
+
+
+async def save_products_to_db(products: list, user_id: str):
+    """Guarda productos con upsert usando (shopify_id, user_id) como conflict key."""
+    from core.graph import supabase
+    
+    records = []
+    for product in products:
+        # Extraer variantes
+        variants_edges = product.get("variants", {}).get("edges", [])
+        first_variant = variants_edges[0].get("node", {}) if variants_edges else {}
+        price_str = first_variant.get("price")
+        price_val = float(price_str) if price_str is not None else None
+        
+        tags = product.get("tags", [])
+        tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags or "")
+        
+        record = {
+            "shopify_id": product["id"],  # gid://shopify/Product/...
+            "user_id": user_id,
+            "current_title": product.get("title", ""),
+            "current_body_html": product.get("descriptionHtml", ""),
+            "vendor": product.get("vendor", ""),
+            "tags": tags_str,
+            "image_url": product.get("featuredImage", {}).get("url", "") if product.get("featuredImage") else "",
+            "price": price_val,
+            "inventory_quantity": first_variant.get("inventoryQuantity", 0) if first_variant else 0,
+            "audit_status": "PENDING_AUDIT",
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+        records.append(record)
+    
+    # Upsert en lotes de 100
+    batch_size = 100
+    for i in range(0, len(records), batch_size):
+        batch = records[i:i + batch_size]
+        supabase.table("shopify_products").upsert(
+            batch,
+            on_conflict="shopify_id,user_id"
+        ).execute()
+
+
+async def sync_shopify_products(user_id: str, shop_url: str, access_token: str):
+    """Sync completo con resume."""
+    from core.graph import supabase
+    
+    # 1. Buscar si hay un sync_job en progreso (para resume)
+    result = supabase.table("sync_jobs")\
+        .select("*")\
+        .eq("user_id", user_id)\
+        .eq("status", "syncing")\
+        .order("created_at", desc=True)\
+        .limit(1)\
+        .execute()
+    
+    if result.data:
+        # Hay un sync interrumpido — continuar desde el cursor
+        job = result.data[0]
+        job_id = job["id"]
+        last_cursor = job.get("last_sync_cursor")
+        print(f"Resuming sync from cursor: {last_cursor}")
+        products = await fetch_all_products(shop_url, access_token, job_id, last_cursor=last_cursor)
+    else:
+        # Obtener total aproximado antes de empezar
+        products_total = 0
+        try:
+            count_res = await shopify_graphql_request(
+                shop_url,
+                access_token,
+                "query { productsCount { count } }"
+            )
+            products_total = count_res.get("data", {}).get("productsCount", {}).get("count", 0)
+        except Exception as count_err:
+            print(f"⚠️ Could not fetch productsCount: {count_err}")
+            
+        # No hay sync en progreso — crear nuevo job
+        job_result = supabase.table("sync_jobs").insert({
+            "user_id": user_id,
+            "status": "syncing",
+            "products_total": products_total,
+            "started_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+        job_id = job_result.data[0]["id"]
+        print("Starting fresh sync")
+        products = await fetch_all_products(shop_url, access_token, job_id, last_cursor=None)
+    
+    # 2. Guardar productos en shopify_products (upsert)
+    await save_products_to_db(products, user_id)
+    
+    # 3. Marcar sync como completo
+    await complete_sync_job(job_id, len(products))
+    
+    return {"status": "completed", "products_synced": len(products)}
