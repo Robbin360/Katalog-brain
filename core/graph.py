@@ -465,19 +465,25 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
                     .select("shop_url, access_token")
                     .eq("user_id", user_id)
                     .eq("provider", "shopify")
-                    .maybe_single()
+                    .limit(1)
                     .execute()
                 )
-                integration_data = integration_res.data or {}
+                integration_data = integration_res.data[0] if integration_res.data else {}
                 shop_domain = integration_data.get("shop_url", "")
-                access_token = integration_data.get("access_token", "")
+                encrypted_token = integration_data.get("access_token", "")
 
-                if shop_domain and access_token:
-                    taxonomy_text, taxonomy_ok = await get_product_taxonomy(
-                        shopify_numeric_id=shopify_id,
-                        shop_domain=shop_domain,
-                        access_token=access_token
+                if shop_domain and encrypted_token:
+                    decrypted_res = await _run_sync(
+                        lambda: supabase.rpc("decrypt_shopify_token", {"p_ciphertext_b64": encrypted_token}).execute()
                     )
+                    access_token = decrypted_res.data
+
+                    if access_token:
+                        taxonomy_text, taxonomy_ok = await get_product_taxonomy(
+                            shopify_numeric_id=shopify_id,
+                            shop_domain=shop_domain,
+                            access_token=access_token
+                        )
             except Exception as e:
                 print(f"⚠️ [Nodo 1] Error obteniendo taxonomía: {e}")
                 taxonomy_ok = False
@@ -1149,16 +1155,25 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
             .select("shop_url,access_token")
             .eq("user_id", user_id)
             .eq("provider", "shopify")
-            .single()
+            .limit(1)
             .execute()
         )
-        integration_data = integration_res.data or {}
+        integration_data = integration_res.data[0] if integration_res.data else {}
         if not integration_data:
             raise ValueError(f"No hay integración Shopify para usuario {user_id}")
 
+        encrypted_token = integration_data.get("access_token", "")
+        if not encrypted_token:
+            raise ValueError("No se encontró access_token en integración Shopify")
+
+        decrypted_res = await _run_sync(
+            lambda: supabase.rpc("decrypt_shopify_token", {"p_ciphertext_b64": encrypted_token}).execute()
+        )
+        access_token = decrypted_res.data
+
         await publish_product_to_shopify(
             shop_url=integration_data.get("shop_url", ""),
-            access_token=integration_data.get("access_token", ""),
+            access_token=access_token,
             product_shopify_id=context.shopify_id,
             title=title,
             html=html,
