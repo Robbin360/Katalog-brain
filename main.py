@@ -1,12 +1,20 @@
 import os
-import asyncio  # <-- Añadido para pausar el tiempo
+import asyncio
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends  # <-- Añadido BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, AliasChoices
 from typing import Union, Optional
 from supabase import create_client, Client
+
+# Fix for WinError 10035 (WSAEWOULDBLOCK) on Windows with parallel async sockets.
+# The default ProactorEventLoop has issues with non-blocking sockets in
+# parallel async contexts. WindowsSelectorEventLoopPolicy uses select()
+# instead of IOCP, which is more compatible. Linux/macOS are unaffected.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Importamos el Grafo pesado y el Agente rápido
 from core.graph import katalog_agent

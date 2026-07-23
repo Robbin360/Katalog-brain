@@ -7,11 +7,31 @@ from typing import Any
 import stripe
 from core.graph import katalog_agent, supabase
 from agents.inspector_agent import inspector_agent
+from core.rate_limiter import rate_limiter, detect_provider_from_model
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
-PATROL_INTERVAL_SECONDS: int = 30
-MAX_PRODUCTS_PER_PATROL: int = 3
+DEFAULT_PATROL_INTERVAL_SECONDS: int = 60
+
+TIER_PATROL_INTERVALS = {
+    "free": 60,
+    "starter": 60,
+    "pro": 300,
+    "business": 600,
+    "enterprise": 600,
+}
+
+DEFAULT_BATCH_SIZE: int = 3
+MAX_BATCH_SIZE_CAP: int = 50
+
+TIER_BATCH_PARALLELISM = {
+    "free": 1,
+    "starter": 1,
+    "pro": 2,
+    "business": 3,
+    "enterprise": 5,
+}
+
 STATUS_PROCESSING: str = "PROCESSING"
 
 
@@ -117,6 +137,49 @@ def _reconcile_stripe_subscriptions() -> int:
 
 # Global de control para ejecutar la reconciliación 1 vez por día
 _last_reconciliation_date: date | None = None
+
+
+async def process_single_product(product: dict, user_id: str, plan_tier: str) -> dict:
+    product_id = str(product.get("id", ""))
+    if not product_id:
+        return {"product_id": None, "success": False, "error": "missing_id", "credits_consumed": 0}
+
+    try:
+        action = "Publicando" if product.get("audit_status") == "READY_TO_PUBLISH" else "Optimizando"
+        print(f"🚀 [Auto-Pilot] {action} producto ID {product_id} (user: {user_id}, tier: {plan_tier})...")
+
+        final_state = await katalog_agent.ainvoke({
+            "product_id": product_id,
+            "auto_pilot_enabled": True,
+            "current_status": product.get("audit_status"),
+        })
+
+        if final_state.get("error") or final_state.get("status") == "ERROR":
+            error_msg = final_state.get("error", "unknown_error")
+            print(f"❌ [Auto-Pilot] Producto ID {product_id} terminó con error: {error_msg}")
+            return {
+                "product_id": product_id,
+                "success": False,
+                "error": error_msg,
+                "credits_consumed": 0,
+            }
+        else:
+            print(f"✅ [Auto-Pilot] Producto ID {product_id} optimizado con éxito.")
+            return {
+                "product_id": product_id,
+                "success": True,
+                "error": None,
+                "credits_consumed": 1,
+            }
+
+    except Exception as product_error:
+        print(f"❌ [Auto-Pilot] Error procesando producto ID {product_id}: {product_error}")
+        return {
+            "product_id": product_id,
+            "success": False,
+            "error": str(product_error),
+            "credits_consumed": 0,
+        }
 
 
 async def auto_pilot_patrol() -> None:
@@ -269,7 +332,7 @@ async def auto_pilot_patrol() -> None:
         try:
             profiles_res = await _run_sync(
                 lambda: supabase.table("profiles")
-                .select("id,auto_pilot_enabled,credits_used,credits_total,credits_reserved")
+                .select("id,auto_pilot_enabled,credits_used,credits_total,credits_reserved,plan_tier,auto_pilot_patrol_limit,feature_flags")
                 .eq("auto_pilot_enabled", True)
                 .execute()
             )
@@ -308,7 +371,18 @@ async def auto_pilot_patrol() -> None:
                     if credits_remaining <= 0:
                         continue
                     
-                    batch_limit = min(MAX_PRODUCTS_PER_PATROL, credits_remaining)
+                    plan_tier = profile.get("plan_tier", "free")
+                    parallelism = TIER_BATCH_PARALLELISM.get(plan_tier, 1)
+                    patrol_interval = TIER_PATROL_INTERVALS.get(plan_tier, DEFAULT_PATROL_INTERVAL_SECONDS)
+                    
+                    raw_patrol_limit = profile.get("auto_pilot_patrol_limit")
+                    try:
+                        patrol_limit = int(raw_patrol_limit) if raw_patrol_limit is not None else DEFAULT_BATCH_SIZE
+                        patrol_limit = max(1, min(patrol_limit, MAX_BATCH_SIZE_CAP))
+                    except (ValueError, TypeError):
+                        patrol_limit = DEFAULT_BATCH_SIZE
+                    
+                    batch_limit = min(patrol_limit, credits_remaining)
                     current_iso_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                     
                     eligible_filter = (
@@ -341,39 +415,98 @@ async def auto_pilot_patrol() -> None:
                         f"({credits_remaining} créditos disponibles)."
                     )
                     
-                    for product in claimed_products:
-                        product_id = str(product.get("id", ""))
-                        if not product_id:
-                            continue
-                        
-                        try:
-                            action = "Publicando" if product.get("audit_status") == "READY_TO_PUBLISH" else "Optimizando"
-                            print(f"🚀 [Auto-Pilot] {action} producto ID {product_id}...")
-                            final_state = await katalog_agent.ainvoke({
-                                "product_id": product_id,
-                                "auto_pilot_enabled": True,
-                                "current_status": product.get("audit_status"),
-                            })
-                            
-                            if final_state.get("error") or final_state.get("status") == "ERROR":
-                                print(
-                                    f"❌ [Auto-Pilot] Producto ID {product_id} terminó con error: "
-                                    f"{final_state.get('error', 'Ver error_log')}"
-                                )
-                            else:
-                                print(f"✅ [Auto-Pilot] Producto ID {product_id} optimizado con éxito.")
-                        except Exception as product_error:
-                            print(f"❌ [Auto-Pilot] Error procesando producto ID {product_id}: {product_error}")
-                            
+                    patrol_started_at = datetime.now(timezone.utc)
+
+                    products_processed = 0
+                    products_succeeded = 0
+                    products_failed = 0
+                    credits_consumed = 0
+
+                    if parallelism <= 1 or len(claimed_products) <= 1:
+                        for product in claimed_products:
+                            result = await process_single_product(product, user_id, plan_tier)
+                            if isinstance(result, dict):
+                                products_processed += 1
+                                if result.get("success"):
+                                    products_succeeded += 1
+                                    credits_consumed += result.get("credits_consumed", 0)
+                                else:
+                                    products_failed += 1
+                    else:
+                        print(f"🔄 [Auto-Pilot] Procesando {len(claimed_products)} productos en paralelo (batch_size={parallelism}, tier={plan_tier})...")
+
+                        batches = [
+                            claimed_products[i:i + parallelism]
+                            for i in range(0, len(claimed_products), parallelism)
+                        ]
+
+                        for batch_idx, batch in enumerate(batches):
+                            print(f"📦 [Auto-Pilot] Procesando batch {batch_idx + 1}/{len(batches)} ({len(batch)} productos)...")
+
+                            tasks = [
+                                process_single_product(product, user_id, plan_tier)
+                                for product in batch
+                            ]
+
+                            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                            for result in results:
+                                if isinstance(result, Exception):
+                                    print(f"❌ [Auto-Pilot] Batch exception: {result}")
+                                    products_failed += 1
+                                elif isinstance(result, dict):
+                                    products_processed += 1
+                                    if result.get("success"):
+                                        products_succeeded += 1
+                                        credits_consumed += result.get("credits_consumed", 0)
+                                    else:
+                                        products_failed += 1
+
+                        print(
+                            f"📊 [Auto-Pilot] Patrol completo para user {user_id}: "
+                            f"{products_processed} procesados, {products_succeeded} exitosos, "
+                            f"{products_failed} fallidos, {credits_consumed} créditos consumidos"
+                        )
+
+                    patrol_completed_at = datetime.now(timezone.utc)
+                    try:
+                        await _run_sync(
+                            lambda: supabase.table("auto_pilot_patrol_logs").insert({
+                                "user_id": user_id,
+                                "patrol_started_at": patrol_started_at.isoformat(),
+                                "patrol_completed_at": patrol_completed_at.isoformat(),
+                                "plan_tier": plan_tier,
+                                "patrol_limit": patrol_limit,
+                                "patrol_interval_seconds": patrol_interval,
+                                "feature_flag_enabled": True,
+                                "products_processed": products_processed,
+                                "products_succeeded": products_succeeded,
+                                "products_failed": products_failed,
+                                "credits_consumed": credits_consumed,
+                                "llm_provider_used": "mixed",
+                                "llm_calls_succeeded": 0,
+                                "llm_calls_failed": 0,
+                                "quota_errors": 0,
+                                "error_message": None,
+                                "metadata": {
+                                    "parallelism": parallelism,
+                                    "batch_size": parallelism,
+                                    "products_claimed": len(claimed_products),
+                                },
+                            }).execute()
+                        )
+                    except Exception as log_error:
+                        print(f"⚠️ [Auto-Pilot] Failed to log patrol: {log_error}")
+
                 except Exception as user_products_error:
                     print(f"⚠️ [Auto-Pilot] Error procesando lote del usuario {user_id}: {user_products_error}")
 
         # ==========================================
         # ⏳ Enfriamiento de ciclo
         # ==========================================
-        print(f"⏳ [Auto-Pilot] Patrullaje completado. Esperando {PATROL_INTERVAL_SECONDS} segundos...")
+        print(f"⏳ [Auto-Pilot] Patrullaje completado. Esperando {DEFAULT_PATROL_INTERVAL_SECONDS} segundos...")
         try:
-            await asyncio.sleep(PATROL_INTERVAL_SECONDS)
+            await asyncio.sleep(DEFAULT_PATROL_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             print("🛑 [Auto-Pilot] Worker detenido por apagado del servidor.")
             raise
