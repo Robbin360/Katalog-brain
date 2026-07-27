@@ -51,6 +51,21 @@ _SKIP_QUADRANTS = {QUADRANT_STABLE, QUADRANT_MONITORING, QUADRANT_BENCHMARK, QUA
 
 BILLING_BASE_CREDITS = 1  # único costo por producto, Investigador incluido (modelo flat)
 
+TONE_PROMPT_MAP = {
+    "professional": "Write in a clear, direct, results-oriented tone. Be authoritative without being stiff. Use precise language.",
+    "friendly": "Write in an approachable, warm, and accessible tone. No technical jargon. Speak like a helpful friend.",
+    "aspirational": "Write in an aspirational tone that sells identity and transformation. Paint a picture of the lifestyle.",
+    "technical": "Write in a technical tone focused on specifications, data, and evidence. Use precise terminology.",
+    "minimalist": "Write in a minimalist tone. Clean, concise, premium. Every word must earn its place. Less is more.",
+    "storytelling": "Write in a storytelling tone. Tell the story behind the product — its origin, craft, and maker."
+}
+
+AUDIENCE_PROMPT_MAP = {
+    "consumer": "The target audience is end consumers. They make quick, emotional purchase decisions. Lead with benefits.",
+    "business": "The target audience is business buyers. They make rational, ROI-driven decisions. Lead with specs & ROI.",
+    "reseller": "The target audience is resellers and distributors. They buy in volume. Lead with bulk specifications."
+}
+
 
 async def _run_sync(callable_obj):
     return await asyncio.to_thread(callable_obj)
@@ -445,8 +460,8 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
         )
 
         rules = BrandRules(
-            tone_voice=rules_data.get("tone_voice", "Professional"),
-            target_audience=rules_data.get("target_audience", "General"),
+            tone_voice=rules_data.get("tone_voice", "professional"),
+            target_audience=rules_data.get("target_audience", "consumer"),
             language=rules_data.get("language", "English"),
             forbidden_words=rules_data.get("forbidden_words", []),
             brand_dna=rules_data.get("brand_dna", ""),
@@ -602,6 +617,12 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     Usa mejores prácticas generales de SEO para la descripción.
 """
 
+    raw_tone = (rules.tone_voice or "professional").lower().strip()
+    raw_audience = (rules.target_audience or "consumer").lower().strip()
+
+    tone_instruction = TONE_PROMPT_MAP.get(raw_tone, TONE_PROMPT_MAP["professional"])
+    audience_instruction = AUDIENCE_PROMPT_MAP.get(raw_audience, AUDIENCE_PROMPT_MAP["consumer"])
+
     prompt = f"""
     PRODUCT TO OPTIMIZE:
     - Title: {context.current_title}
@@ -613,8 +634,8 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     {memory}
 
     BRAND RULES:
-    - Tone: {rules.tone_voice}
-    - Audience: {rules.target_audience}
+    - Tone: {tone_instruction}
+    - Audience: {audience_instruction}
     - Language: {rules.language}
     - Forbidden Words: {', '.join(rules.forbidden_words)}
     - DNA: {rules.brand_dna}
@@ -979,9 +1000,12 @@ async def review_proposal(state: KatalogState) -> dict[str, Any]:
         return {"error": "No hay propuesta para evaluar.", "iterations": iteration}
 
     rules = state["brand_rules"]
+    raw_tone = (rules.tone_voice or "professional").lower().strip()
+    tone_instruction = TONE_PROMPT_MAP.get(raw_tone, TONE_PROMPT_MAP["professional"])
+
     prompt = f"""
     BRAND RULES TO ENFORCE:
-    - Tone: {rules.tone_voice}
+    - Tone: {tone_instruction}
     - Forbidden Words: {', '.join(rules.forbidden_words)}
     - Brand DNA: {rules.brand_dna}
 
