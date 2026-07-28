@@ -295,13 +295,13 @@ async def fail_sync_job(job_id: str, error_message: str):
     await asyncio.to_thread(_update)
 
 
-async def fetch_all_products(shop_url: str, access_token: str, job_id: str, last_cursor: str = None, initial_count: int = 0):
+async def fetch_all_products(shop_url: str, access_token: str, job_id: str, last_cursor: str = None, initial_count: int = 0, user_id: str = ""):
     """Trae TODOS los productos de una tienda Shopify usando cursor-based pagination y actualiza el job.
-    initial_count es el conteo previo para resume (productos ya sincronizados antes de la interrupción)."""
-    all_products = []
-    cursor = last_cursor  # None si es sync desde cero, o el último cursor guardado si es resume
+    Persiste cada página en DB antes de avanzar el cursor para evitar pérdida por caídas."""
+    cursor = last_cursor
     has_next = True
-    
+    products_synced = initial_count
+
     while has_next:
         query = """
         query getProducts($first: Int!, $after: String) {
@@ -342,43 +342,34 @@ async def fetch_all_products(shop_url: str, access_token: str, job_id: str, last
           }
         }
         """
-        
+
         variables = {
             "first": 250,
             "after": cursor
         }
-        
-        response = await shopify_graphql_request(
-            shop_url, 
-            access_token, 
-            query, 
-            variables
-        )
-        
+
+        response = await shopify_graphql_request(shop_url, access_token, query, variables)
+
         if "errors" in response and response["errors"]:
             raise RuntimeError(f"Shopify GraphQL Error: {response['errors'][0].get('message')}")
-            
+
         products_page = response["data"]["products"]["edges"]
         page_info = response["data"]["products"]["pageInfo"]
-        
-        for edge in products_page:
-            product = edge["node"]
-            all_products.append(product)
-        
-        # Actualizar cursor
+
+        page_products = [edge["node"] for edge in products_page]
+        if page_products and user_id:
+            await save_products_to_db(page_products, user_id)
+
         cursor = page_info["endCursor"]
         has_next = page_info["hasNextPage"]
-        
-        # Guardar el cursor en sync_jobs después de CADA página (para resume)
-        # Usar conteo TOTAL (previos + nuevos de esta sesión)
-        total_so_far = initial_count + len(all_products)
-        await update_sync_cursor(job_id, cursor, total_so_far)
-        
-        # Throttle: leer el costo de la query del response y pacear
+        products_synced += len(page_products)
+
+        await update_sync_cursor(job_id, cursor, products_synced)
+
         throttle_status = response.get("extensions", {}).get("cost", {}).get("throttleStatus", {})
         await handle_throttle(throttle_status)
-    
-    return all_products
+
+    return products_synced - initial_count
 
 
 async def save_products_to_db(products: list, user_id: str):
@@ -426,10 +417,9 @@ async def save_products_to_db(products: list, user_id: str):
 
 
 async def sync_shopify_products(user_id: str, shop_url: str, access_token: str):
-    """Sync completo con resume."""
+    """Sync completo con resume. Cada página se persiste antes de avanzar el cursor."""
     from core.graph import supabase
     
-    # 1. Buscar si hay un sync_job en progreso (para resume)
     def _find_prev_job():
         return supabase.table("sync_jobs")\
             .select("*")\
@@ -442,17 +432,14 @@ async def sync_shopify_products(user_id: str, shop_url: str, access_token: str):
     result = await asyncio.to_thread(_find_prev_job)
     
     if result.data:
-        # RESUME: hay un sync interrumpido — continuar desde el cursor
         job = result.data[0]
         job_id = job["id"]
         last_cursor = job.get("last_sync_cursor")
         already_synced = job.get("products_synced", 0)
         print(f"Resuming sync from cursor: {last_cursor} (already synced: {already_synced})")
-        products = await fetch_all_products(shop_url, access_token, job_id, last_cursor=last_cursor, initial_count=already_synced)
-        total_synced = already_synced + len(products)
+        new_products = await fetch_all_products(shop_url, access_token, job_id, last_cursor=last_cursor, initial_count=already_synced, user_id=user_id)
+        total_synced = already_synced + new_products
     else:
-        # FRESH: nuevo sync desde cero
-        # Obtener total aproximado antes de empezar
         products_total = 0
         try:
             count_res = await shopify_graphql_request(
@@ -464,7 +451,6 @@ async def sync_shopify_products(user_id: str, shop_url: str, access_token: str):
         except Exception as count_err:
             print(f"⚠️ Could not fetch productsCount: {count_err}")
             
-        # No hay sync en progreso — crear nuevo job
         def _create_job():
             return supabase.table("sync_jobs").insert({
                 "user_id": user_id,
@@ -476,13 +462,8 @@ async def sync_shopify_products(user_id: str, shop_url: str, access_token: str):
         job_result = await asyncio.to_thread(_create_job)
         job_id = job_result.data[0]["id"]
         print("Starting fresh sync")
-        products = await fetch_all_products(shop_url, access_token, job_id, last_cursor=None, initial_count=0)
-        total_synced = len(products)
+        new_products = await fetch_all_products(shop_url, access_token, job_id, last_cursor=None, initial_count=0, user_id=user_id)
+        total_synced = new_products
     
-    # 2. Guardar productos en shopify_products (upsert)
-    await save_products_to_db(products, user_id)
-    
-    # 3. Marcar sync como completo con el conteo TOTAL
     await complete_sync_job(job_id, total_synced)
-    
     return {"status": "completed", "products_synced": total_synced}

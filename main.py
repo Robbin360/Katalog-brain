@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import sys
 from collections.abc import AsyncIterator
@@ -6,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, AliasChoices
-from typing import Union, Optional
+from typing import Union, Optional, Literal
 from supabase import create_client, Client
 
 # Fix for WinError 10035 (WSAEWOULDBLOCK) on Windows with parallel async sockets.
@@ -16,9 +17,7 @@ from supabase import create_client, Client
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# Importamos el Grafo pesado y el Agente rápido
 from core.graph import katalog_agent
-from core.worker import auto_pilot_patrol
 from agents.inspector_agent import inspector_agent
 from core.auth import get_current_user_id
 
@@ -26,19 +25,11 @@ from core.auth import get_current_user_id
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     print("🚀 [Servidor] Iniciando Katalog AI Brain...")
-    auto_pilot_task = asyncio.create_task(auto_pilot_patrol())
-    app.state.auto_pilot_task = auto_pilot_task
-    print("🤖 [Servidor] Auto-Pilot Worker encendido.")
-
+    print("🤖 [Servidor] Auto-Pilot corre aparte: python -m workers.autopilot")
     try:
         yield
     finally:
-        print("⏳ [Servidor] Apagando Auto-Pilot Worker...")
-        auto_pilot_task.cancel()
-        try:
-            await auto_pilot_task
-        except asyncio.CancelledError:
-            print("✅ [Servidor] Auto-Pilot Worker detenido correctamente.")
+        print("✅ [Servidor] Apagado.")
 
 # Inicializamos la API
 app = FastAPI(
@@ -143,14 +134,18 @@ async def process_triage_queue():
 # ⚡ ENDPOINT 1: DISPARADOR DEL TRIAJE
 # ==========================================
 @app.post("/api/triage")
-async def run_triage_scan(background_tasks: BackgroundTasks):
+async def run_triage_scan(
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
+):
     # En lugar de hacer esperar al usuario, le pasamos el trabajo al empleado de fondo
     background_tasks.add_task(process_triage_queue)
     
     # Respondemos en 0.01 segundos
     return {
         "status": "ACCEPTED", 
-        "message": "Triaje iniciado en segundo plano. Escaneando a 4 productos por minuto."
+        "message": "Triaje iniciado en segundo plano. Escaneando a 4 productos por minuto.",
+        "user_id": user_id,
     }
 
 
@@ -220,35 +215,57 @@ async def optimize_product(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- SHOPIFY SYNC ENDPOINT (FIX 16) ---
+# --- SHOPIFY SYNC ENDPOINT ---
+SHOPIFY_DOMAIN = re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$")
+
 class ShopifySyncRequest(BaseModel):
-    user_id: str
-    shop_url: str
-    access_token: str
+    provider: str = "shopify"
+
+def validate_shopify_domain(value: str) -> str:
+    host = value.strip().lower().removeprefix("https://").removeprefix("http://").rstrip("/")
+    if not SHOPIFY_DOMAIN.fullmatch(host):
+        raise HTTPException(400, "Invalid Shopify shop domain")
+    return host
 
 @app.post("/api/shopify/sync")
 async def trigger_shopify_sync(
     request: ShopifySyncRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
 ):
-    print(f"🔄 [Sync API] Received sync request for user {request.user_id} ({request.shop_url})")
-    
+    integration = await run_sync_io(
+        lambda: supabase.table("integrations_safe")
+        .select("shop_url, access_token, shop_name")
+        .eq("user_id", user_id)
+        .eq("provider", "shopify")
+        .is_("uninstalled_at", "null")
+        .single()
+        .execute()
+    )
+    row = integration.data
+    if not row:
+        raise HTTPException(404, "No active Shopify integration")
+
+    shop_url = validate_shopify_domain(row["shop_url"])
+    access_token = row["access_token"]
+    print(f"🔄 [Sync API] Sync for user {user_id} ({shop_url})")
+
     async def run_sync_task():
         try:
             from core.shopify_api import sync_shopify_products
             await sync_shopify_products(
-                user_id=request.user_id,
-                shop_url=request.shop_url,
-                access_token=request.access_token
+                user_id=user_id,
+                shop_url=shop_url,
+                access_token=access_token
             )
-            print(f"✅ [Sync API] Sync completed for user {request.user_id}")
+            print(f"✅ [Sync API] Sync completed for user {user_id}")
         except Exception as e:
-            print(f"❌ [Sync API] Sync failed for user {request.user_id}: {e}")
+            print(f"❌ [Sync API] Sync failed for user {user_id}: {e}")
             try:
                 def _find_syncing_job():
                     return supabase.table("sync_jobs")\
                         .select("id")\
-                        .eq("user_id", request.user_id)\
+                        .eq("user_id", user_id)\
                         .eq("status", "syncing")\
                         .order("created_at", desc=True)\
                         .limit(1)\
@@ -263,7 +280,7 @@ async def trigger_shopify_sync(
                 print(f"⚠️ [Sync API] Failed to mark job as failed: {inner_e}")
 
     background_tasks.add_task(run_sync_task)
-    
+
     return {
         "status": "ACCEPTED",
         "message": "Shopify sync process started in the background."

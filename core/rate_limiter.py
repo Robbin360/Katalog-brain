@@ -1,4 +1,5 @@
 import asyncio
+import random
 import time
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
@@ -42,33 +43,38 @@ class ProviderRateLimiter:
             print(f"⏳ [RateLimiter] {provider} at limit ({count}/{limit} RPM). Waiting {wait_seconds:.1f}s...")
             await asyncio.sleep(wait_seconds)
 
+    def _is_retryable(self, exc: Exception) -> bool:
+        error_str = str(exc).lower()
+        return (
+            "429" in error_str
+            or "rate limit" in error_str
+            or "quota" in error_str
+            or "too many requests" in error_str
+            or "timeout" in error_str
+            or "503" in error_str
+            or "502" in error_str
+            or "service unavailable" in error_str
+        )
+
     async def call_with_retry(
         self,
         provider: str,
         fn: Callable[[], Awaitable[Any]],
         max_retries: int = 3,
     ) -> Any:
-        last_exception = None
+        last = None
         for attempt in range(max_retries + 1):
             await self.acquire(provider)
             try:
-                result = await fn()
-                return result
-            except Exception as e:
-                last_exception = e
-                error_str = str(e).lower()
-                is_rate_limit = (
-                    "429" in error_str
-                    or "rate limit" in error_str
-                    or "quota" in error_str
-                    or "too many requests" in error_str
-                )
-                if not is_rate_limit or attempt == max_retries:
+                return await fn()
+            except Exception as exc:
+                last = exc
+                if not self._is_retryable(exc) or attempt == max_retries:
                     raise
-                wait_seconds = 2 ** (attempt + 1)
-                print(f"⚠️ [RateLimiter] {provider} returned 429 (attempt {attempt + 1}/{max_retries}). Backing off {wait_seconds}s...")
-                await asyncio.sleep(wait_seconds)
-        raise last_exception
+                delay = min(60, 2 ** attempt) + random.uniform(0, 0.5)
+                print(f"⚠️ [RateLimiter] {provider} error (attempt {attempt + 1}/{max_retries}). Backing off {delay:.1f}s...")
+                await asyncio.sleep(delay)
+        raise last
 
 
 rate_limiter = ProviderRateLimiter()
