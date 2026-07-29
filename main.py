@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, AliasChoices
-from typing import Union, Optional, Literal
+from typing import Union
 from supabase import create_client, Client
 
 # Fix for WinError 10035 (WSAEWOULDBLOCK) on Windows with parallel async sockets.
@@ -110,12 +110,21 @@ async def process_triage_queue():
             audit_data = getattr(result, 'data', getattr(result, 'output', result))
             
             # 3. Guardar el veredicto en Supabase al instante
-            await run_sync_io(lambda: supabase.table('shopify_products').update({
-                'seo_score_initial': audit_data.score,
-                'audit_score': audit_data.score,
-                'error_log': audit_data.reason, 
-                'audit_status': 'NEEDS_OPTIMIZATION' if audit_data.score < 90 else 'READY_TO_PUBLISH'
-            }).eq('id', prod['id']).execute())
+            _score = audit_data.score
+            _reason = audit_data.reason
+            _product_id = prod['id']
+            _new_status = 'NEEDS_OPTIMIZATION' if _score < 90 else 'READY_TO_PUBLISH'
+
+            async def _save_audit(s=_score, r=_reason, pid=_product_id, ns=_new_status):
+                def _update():
+                    supabase.table('shopify_products').update({
+                        'seo_score_initial': s,
+                        'audit_score': s,
+                        'error_log': r,
+                        'audit_status': ns,
+                    }).eq('id', pid).execute()
+                await asyncio.to_thread(_update)
+            await _save_audit()
             
             print(f"✅ Score: {audit_data.score}/100 | Motivo: {audit_data.reason}")
             

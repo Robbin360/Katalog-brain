@@ -1,13 +1,12 @@
+import asyncio
 import os
 import time
-import asyncio
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import stripe
-from core.graph import katalog_agent, supabase
 from agents.inspector_agent import inspector_agent
-from core.rate_limiter import rate_limiter, detect_provider_from_model
+from core.graph import katalog_agent, supabase
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
@@ -216,10 +215,10 @@ async def auto_pilot_patrol() -> None:
             
             # Buscar productos atascados en PROCESSING
             zombie_res = await _run_sync(
-                lambda: supabase.table("shopify_products")
+                lambda zt=zombie_timeout: supabase.table("shopify_products")
                 .select("id,retry_attempts,user_id,billing_state,reservation_id")
                 .eq("audit_status", STATUS_PROCESSING)
-                .lt("updated_at", zombie_timeout)
+                .lt("updated_at", zt)
                 .execute()
             )
             zombies: list[dict[str, Any]] = zombie_res.data or []
@@ -393,11 +392,11 @@ async def auto_pilot_patrol() -> None:
                     )
                     
                     products_res = await _run_sync(
-                        lambda: supabase.table("shopify_products")
+                        lambda uid=user_id, ef=eligible_filter, bl=batch_limit: supabase.table("shopify_products")
                         .select("id,user_id,current_title,audit_status,retry_attempts,next_retry_at")
-                        .eq("user_id", user_id)
-                        .or_(eligible_filter)
-                        .limit(batch_limit)
+                        .eq("user_id", uid)
+                        .or_(ef)
+                        .limit(bl)
                         .execute()
                     )
                     products: list[dict[str, Any]] = products_res.data or []
@@ -471,27 +470,27 @@ async def auto_pilot_patrol() -> None:
                     patrol_completed_at = datetime.now(timezone.utc)
                     try:
                         await _run_sync(
-                            lambda: supabase.table("auto_pilot_patrol_logs").insert({
-                                "user_id": user_id,
-                                "patrol_started_at": patrol_started_at.isoformat(),
-                                "patrol_completed_at": patrol_completed_at.isoformat(),
-                                "plan_tier": plan_tier,
-                                "patrol_limit": patrol_limit,
-                                "patrol_interval_seconds": patrol_interval,
+                            lambda uid=user_id, psa=patrol_started_at, pca=patrol_completed_at, pt=plan_tier, pl=patrol_limit, pi=patrol_interval, pp=products_processed, ps=products_succeeded, pf=products_failed, cc=credits_consumed, par=parallelism, cp=claimed_products: supabase.table("auto_pilot_patrol_logs").insert({
+                                "user_id": uid,
+                                "patrol_started_at": psa.isoformat(),
+                                "patrol_completed_at": pca.isoformat(),
+                                "plan_tier": pt,
+                                "patrol_limit": pl,
+                                "patrol_interval_seconds": pi,
                                 "feature_flag_enabled": True,
-                                "products_processed": products_processed,
-                                "products_succeeded": products_succeeded,
-                                "products_failed": products_failed,
-                                "credits_consumed": credits_consumed,
+                                "products_processed": pp,
+                                "products_succeeded": ps,
+                                "products_failed": pf,
+                                "credits_consumed": cc,
                                 "llm_provider_used": "mixed",
                                 "llm_calls_succeeded": 0,
                                 "llm_calls_failed": 0,
                                 "quota_errors": 0,
                                 "error_message": None,
                                 "metadata": {
-                                    "parallelism": parallelism,
-                                    "batch_size": parallelism,
-                                    "products_claimed": len(claimed_products),
+                                    "parallelism": par,
+                                    "batch_size": par,
+                                    "products_claimed": len(cp),
                                 },
                             }).execute()
                         )

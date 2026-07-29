@@ -103,7 +103,7 @@ async def get_product_taxonomy(
         product_res = await post_graphql(product_query, {"id": product_gid})
         
         # Verificar errores dentro del JSON
-        if "errors" in product_res and product_res["errors"]:
+        if product_res.get("errors"):
             print(f"❌ [shopify_api] Errores GraphQL en GetProductCategory: {product_res['errors']}")
             return ("", False)
             
@@ -165,7 +165,7 @@ async def get_product_taxonomy(
             attr_res = await post_graphql(attributes_query, {"id": taxonomy_category_id})
             
             # Verificar errores en el JSON
-            if "errors" in attr_res and attr_res["errors"]:
+            if attr_res.get("errors"):
                 # Si falla la consulta de atributos (por ejemplo, endpoint o permisos),
                 # caemos en fallback a retornar al menos la categoría principal
                 print(f"⚠️ [shopify_api] Errores GraphQL en GetCategoryAttributes: {attr_res['errors']}")
@@ -217,7 +217,7 @@ async def get_product_taxonomy(
 
 # --- SHOPIFY PAGINATION + THROTTLE + RESUME + UPSERT (FIX 16) ---
 
-async def shopify_graphql_request(shop_url: str, access_token: str, query: str, variables: dict = None) -> dict:
+async def shopify_graphql_request(shop_url: str, access_token: str, query: str, variables: dict | None = None) -> dict:
     """Realiza una petición GraphQL a la API Admin de Shopify."""
     normalized_shop_url = _normalize_shop_url(shop_url)
     endpoint = f"https://{normalized_shop_url}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
@@ -295,7 +295,7 @@ async def fail_sync_job(job_id: str, error_message: str):
     await asyncio.to_thread(_update)
 
 
-async def fetch_all_products(shop_url: str, access_token: str, job_id: str, last_cursor: str = None, initial_count: int = 0, user_id: str = ""):
+async def fetch_all_products(shop_url: str, access_token: str, job_id: str, last_cursor: str | None = None, initial_count: int = 0, user_id: str = ""):
     """Trae TODOS los productos de una tienda Shopify usando cursor-based pagination y actualiza el job.
     Persiste cada página en DB antes de avanzar el cursor para evitar pérdida por caídas."""
     cursor = last_cursor
@@ -350,7 +350,7 @@ async def fetch_all_products(shop_url: str, access_token: str, job_id: str, last
 
         response = await shopify_graphql_request(shop_url, access_token, query, variables)
 
-        if "errors" in response and response["errors"]:
+        if response.get("errors"):
             raise RuntimeError(f"Shopify GraphQL Error: {response['errors'][0].get('message')}")
 
         products_page = response["data"]["products"]["edges"]
