@@ -559,6 +559,12 @@ async def retrieve_knowledge(state: KatalogState) -> dict[str, Any]:
         return {"rag_knowledge": []}
 
     try:
+        user_id = state.get("user_id")
+        if not user_id:
+            raise ValueError(
+                "user_id ausente: no se puede consultar knowledge_base sin tenant"
+            )
+
         result = await _run_sync(
             lambda: genai_client.models.embed_content(
                 model='models/gemini-embedding-2',
@@ -573,12 +579,16 @@ async def retrieve_knowledge(state: KatalogState) -> dict[str, Any]:
                 "query_embedding": vector,
                 "match_threshold": 0.5,
                 "match_count": 3,
+                "filter": {},
+                "p_user_id": user_id,
             }).execute()
         )
 
         matches = rpc_res.data or []
         print(f"📚 [Nodo 2B] {len(matches)} consejos recuperados de la Knowledge Base.")
         return {"rag_knowledge": matches}
+    except ValueError:
+        raise
     except Exception as e:
         print(f"⚠️ [Nodo 2B] Error consultando RAG: {e}")
         return {"rag_knowledge": []}
