@@ -330,21 +330,14 @@ async def auto_pilot_patrol() -> None:
         profiles: list[dict[str, Any]] = []
         try:
             profiles_res = await _run_sync(
-                lambda: supabase.table("profiles")
-                .select("id,auto_pilot_enabled,credits_used,credits_total,credits_reserved,plan_tier,auto_pilot_patrol_limit,feature_flags")
+                lambda: supabase.table("profile_credits")
+                .select("id,auto_pilot_enabled,credits_available,plan_tier,auto_pilot_patrol_limit,feature_flags")
                 .eq("auto_pilot_enabled", True)
+                .gt("credits_available", 0)
                 .execute()
             )
-            all_enabled_profiles: list[dict[str, Any]] = profiles_res.data or []
-            
-            # Filtrar perfiles con créditos disponibles (restando lo ya reservado)
-            for profile in all_enabled_profiles:
-                credits_used = _to_int(profile.get("credits_used"))
-                credits_total = _to_int(profile.get("credits_total"))
-                credits_reserved = _to_int(profile.get("credits_reserved"))
-                if credits_total - credits_used - credits_reserved > 0:
-                    profiles.append(profile)
-                    
+            profiles = profiles_res.data or []
+
             if not profiles:
                 print("💤 [Auto-Pilot] No hay usuarios Pro/Business activos con créditos disponibles.")
             else:
@@ -362,10 +355,7 @@ async def auto_pilot_patrol() -> None:
                     continue
                 
                 try:
-                    credits_used = _to_int(profile.get("credits_used"))
-                    credits_total = _to_int(profile.get("credits_total"))
-                    credits_reserved = _to_int(profile.get("credits_reserved"))
-                    credits_remaining = max(credits_total - credits_used - credits_reserved, 0)
+                    credits_remaining = max(_to_int(profile.get("credits_available")), 0)
                     
                     if credits_remaining <= 0:
                         continue
