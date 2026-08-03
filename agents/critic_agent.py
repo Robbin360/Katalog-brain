@@ -136,7 +136,7 @@ async def run_critic_with_fallback(prompt: str, proposal: Any = None, rules: Any
             raise
 
         print(
-            "⚠️ [Fallback] Error en Google API (Quota/Timeout). "
-            "Activando motor Groq Llama 3..."
+            f"⚠️ [Fallback] El proveedor primario del juez falló "
+            f"({type(e).__name__}: {e}). Activando modelo de respaldo..."
         )
         return await fallback_critic.run(prompt)

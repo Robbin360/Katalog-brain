@@ -97,16 +97,16 @@ async def run_optimizer_with_fallback(prompt: str) -> Any:
             raise
 
         print(
-            "⚠️ [Fallback] Error en Google API (Quota/Timeout). "
-            "Activando motor Groq Llama 3..."
+            f"⚠️ [Fallback] Proveedor primario falló "
+            f"({type(e).__name__}: {e}). Activando modelo de respaldo..."
         )
         return await fallback_optimizer.run(prompt)
     except Exception as e:
         error_msg = str(e).lower()
         if "output validation" in error_msg or "retries" in error_msg:
             print(
-                f"⚠️ [Fallback] Error de validación en Gemini: {e}. "
-                "Intentando con Groq Llama 3..."
+                f"⚠️ [Fallback] Error de validación en el primario "
+                f"({type(e).__name__}: {e}). Activando modelo de respaldo..."
             )
             return await fallback_optimizer.run(prompt)
         raise
