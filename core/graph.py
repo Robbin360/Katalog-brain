@@ -51,6 +51,11 @@ _SKIP_QUADRANTS = {QUADRANT_STABLE, QUADRANT_MONITORING, QUADRANT_BENCHMARK, QUA
 
 BILLING_BASE_CREDITS = 1  # único costo por producto, Investigador incluido (modelo flat)
 
+# El bucle del crítico ya consumió sus 3 iteraciones dentro de esta misma
+# ejecución. Marcar el máximo (en vez de incrementar en 1) evita que el
+# Auto-Pilot lo vuelva a tomar y repita el ciclo completo dos veces más.
+MAX_CRITIC_ATTEMPTS = 3
+
 TONE_PROMPT_MAP = {
     "professional": "Write in a clear, direct, results-oriented tone. Be authoritative without being stiff. Use precise language.",
     "friendly": "Write in an approachable, warm, and accessible tone. No technical jargon. Speak like a helpful friend.",
@@ -65,6 +70,23 @@ AUDIENCE_PROMPT_MAP = {
     "business": "The target audience is business buyers. They make rational, ROI-driven decisions. Lead with specs & ROI.",
     "reseller": "The target audience is resellers and distributors. They buy in volume. Lead with bulk specifications."
 }
+
+# Se inyecta al escritor cuando el Investigador no produjo dossier.
+# Sin esto, el escritor copia specs de la descripción original y el Juez
+# las rechaza en las 3 iteraciones: bucle garantizado, cero avance.
+NO_DOSSIER_NOTICE = """
+DOSSIER VERIFICADO: Sin specs verificadas.
+
+REGLA ABSOLUTA — el Juez rechazará la propuesta si la incumples:
+NO incluyas ninguna especificación técnica concreta. Esto abarca materiales,
+aleaciones, composición, dimensiones, medidas, pesos, capacidades,
+certificaciones, normas técnicas y cifras de rendimiento.
+
+Esta prohibición aplica AUNQUE esos datos aparezcan en la descripción
+original del producto: no han sido verificados y no puedes tratarlos como
+hechos. Escribe con lenguaje cualitativo (uso previsto, beneficio, acabado,
+durabilidad percibida) sin afirmar ningún dato concreto.
+"""
 
 
 async def _run_sync(callable_obj):
@@ -677,6 +699,8 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     if plan:
         # Formatear dossier del Investigador (si existe)
         dossier_text = format_dossier_for_prompt(research_result) if research_result else ""
+        if not dossier_text.strip():
+            dossier_text = NO_DOSSIER_NOTICE
 
         orchestrator_section = f"""
     ════════════════════════════════════════════════════════
@@ -686,8 +710,7 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     PROBLEMA PRINCIPAL: {plan.primary_problem}
     ESTRATEGIA: {plan.copywriter_instructions}
 """
-        if dossier_text:
-            orchestrator_section += f"""
+        orchestrator_section += f"""
     {dossier_text}
 """
         if loaded_skills:
@@ -1133,6 +1156,8 @@ async def mark_needs_optimization(state: KatalogState) -> dict[str, Any]:
         update_data: dict[str, Any] = {
             "audit_status": STATUS_NEEDS_OPTIMIZATION,
             "error_log": error_log,
+            "retry_attempts": MAX_CRITIC_ATTEMPTS,
+            "next_retry_at": None,
         }
 
         if proposal:

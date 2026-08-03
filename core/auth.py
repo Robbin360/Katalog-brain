@@ -8,12 +8,11 @@ que devuelve get_current_user_id(), porque viene de un JWT verificado
 contra el servidor de Auth de Supabase.
 """
 
-import asyncio
 import logging
 import os
 
+import httpx
 from fastapi import Header, HTTPException
-from supabase import Client, create_client
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +27,55 @@ if not _AUTH_SUPABASE_URL or not _AUTH_SUPABASE_ANON_KEY:
         "privilegios elevados."
     )
 
-# Cliente dedicado y separado del cliente service_role que usa el resto
-# del proyecto (core/graph.py, main.py). Mínimo privilegio: este cliente
-# solo verifica JWTs de usuarios, nunca lee ni escribe tablas.
-_auth_client: Client = create_client(_AUTH_SUPABASE_URL, _AUTH_SUPABASE_ANON_KEY)
+_AUTH_TIMEOUT = httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=5.0)
+
+
+async def _fetch_user(token: str) -> dict | None:
+    """
+    Verifica el token contra el endpoint /auth/v1/user de Supabase.
+
+    Devuelve el payload del usuario si el token es válido, None si Supabase
+    lo rechaza (401/403), y lanza HTTPException(503) si la red falla tras
+    reintentar. Distinguir estos dos casos es deliberado: un fallo de red
+    NO debe reportarse como token inválido.
+
+    Se usa un cliente efímero por petición a propósito. Un cliente de larga
+    vida acumula conexiones muertas en el pool y produce timeouts de
+    handshake TLS intermitentes.
+    """
+    url = f"{_AUTH_SUPABASE_URL}/auth/v1/user"
+    headers = {
+        "apikey": _AUTH_SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {token}",
+    }
+
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            async with httpx.AsyncClient(timeout=_AUTH_TIMEOUT) as client:
+                response = await client.get(url, headers=headers)
+
+            if response.status_code == 200:
+                return response.json()
+
+            if response.status_code in (401, 403):
+                return None
+
+            last_error = RuntimeError(
+                f"Auth de Supabase respondió {response.status_code}"
+            )
+            logger.warning(
+                f"[auth] intento {attempt}: respuesta inesperada "
+                f"{response.status_code}"
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last_error = e
+            logger.warning(f"[auth] intento {attempt} falló por red: {e}")
+
+    raise HTTPException(
+        status_code=503,
+        detail="Servicio de autenticación no disponible. Reintenta en unos segundos.",
+    ) from last_error
 
 
 async def get_current_user_id(authorization: str | None = Header(default=None)) -> str:
@@ -47,6 +91,10 @@ async def get_current_user_id(authorization: str | None = Header(default=None)) 
       - falta el header Authorization
       - el header no tiene el formato 'Bearer <token>'
       - el token es inválido, está mal formado, o expiró
+
+    Lanza HTTPException(503) si el servicio de Auth de Supabase no está
+    disponible (fallo de red tras reintentar). Un 503 intencional evita
+    diagnosticar un problema de red como un token inválido.
     """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
@@ -58,17 +106,12 @@ async def get_current_user_id(authorization: str | None = Header(default=None)) 
     if not token:
         raise HTTPException(status_code=401, detail="Token vacío.")
 
-    try:
-        # auth.get_user() hace una petición HTTP real al servidor de Auth
-        # de Supabase. La movemos a un hilo aparte para no bloquear el
-        # event loop de FastAPI mientras esperamos la respuesta de red.
-        response = await asyncio.to_thread(_auth_client.auth.get_user, token)
-    except Exception as e:
-        logger.warning(f"[auth] Falló la verificación de token: {e}")
+    payload = await _fetch_user(token)
+
+    if payload is None:
         raise HTTPException(status_code=401, detail="Token inválido o expirado.")
 
-    user = getattr(response, "user", None)
-    user_id = getattr(user, "id", None) if user else None
+    user_id = payload.get("id")
 
     if not user_id:
         raise HTTPException(
