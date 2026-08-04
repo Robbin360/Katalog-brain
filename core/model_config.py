@@ -9,7 +9,7 @@ except ModuleNotFoundError:
 load_dotenv()
 
 INSPECTOR_MODEL = os.getenv("INSPECTOR_MODEL", "google-gla:gemini-3.1-flash-lite")
-OPTIMIZER_PRIMARY_MODEL = os.getenv("OPTIMIZER_PRIMARY_MODEL", "google-gla:gemini-2.5-pro")
+OPTIMIZER_PRIMARY_MODEL = os.getenv("OPTIMIZER_PRIMARY_MODEL", "google-gla:gemini-3.5-flash")
 OPTIMIZER_FALLBACK_MODEL = os.getenv("OPTIMIZER_FALLBACK_MODEL", "groq:llama-3.3-70b-versatile")
 CRITIC_PRIMARY_MODEL = os.getenv("CRITIC_PRIMARY_MODEL", "google-gla:gemini-2.5-flash")
 CRITIC_FALLBACK_MODEL = os.getenv("CRITIC_FALLBACK_MODEL", "groq:openai/gpt-oss-120b")

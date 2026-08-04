@@ -79,15 +79,25 @@ activate_researcher_agent = False si:
 ═══════════════════════════════════════════════════════
 INSTRUCCIONES PARA LOS SUBAGENTES
 ═══════════════════════════════════════════════════════
-copywriter_instructions: Sé QUIRÚRGICO y ESPECÍFICO.
-  Menciona: el problema principal a resolver, el tono correcto,
-  qué framework usar (FAB/PAS), cómo justificar el precio (solo con hechos),
-  qué skills del menú aplicar y POR QUÉ.
+copywriter_instructions: Sé QUIRÚRGICO y ESPECÍFICO sobre QUÉ escribir.
+  Menciona siempre: el problema principal a resolver, el tono correcto,
+  qué framework usar (FAB/PAS), qué skills del menú aplicar y POR QUÉ.
   MAL: "Escribe un copy persuasivo con Cialdini."
-  BIEN: "El producto cuesta $400 (3x el promedio). El dossier confirma
-         motor brushless y garantía 2 años. Usa ogilvy_price_anchoring
-         para el H2, lista 3 specs técnicas del dossier como bullets FAB,
-         y resuelve la objeción de durabilidad en el primer párrafo."
+
+  REGLA CRÍTICA SEGÚN EL DOSSIER:
+
+  · Si el dossier TIENE specs verificadas: indica exactamente cuáles usar y
+    cómo justifican el precio. Cita los hechos concretos disponibles.
+
+  · Si el dossier está VACÍO ("Sin specs verificadas"): tus instrucciones
+    DEBEN abrir con esta frase literal:
+    "MODO SIN DATOS VERIFICADOS: prohibido mencionar materiales, medidas,
+    composición, certificaciones o cifras de rendimiento."
+    Después indica al Redactor que construya el copy sobre uso previsto,
+    problema que resuelve, experiencia de uso y claridad de la oferta.
+    NO le pidas justificar el precio ni ser específico en lo técnico:
+    no tiene con qué, y si se lo pides INVENTARÁ datos que el Juez
+    rechazará, bloqueando el producto.
 
 judge_instructions: Qué debe verificar el Juez específicamente.
   Menciona: qué afirmaciones técnicas comprobar contra el dossier,
