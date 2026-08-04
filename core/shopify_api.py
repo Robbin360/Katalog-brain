@@ -397,7 +397,6 @@ async def save_products_to_db(products: list, user_id: str):
             "image_url": product.get("featuredImage", {}).get("url", "") if product.get("featuredImage") else "",
             "price": price_val,
             "inventory_quantity": first_variant.get("inventoryQuantity", 0) if first_variant else 0,
-            "audit_status": "PENDING_AUDIT",
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         records.append(record)

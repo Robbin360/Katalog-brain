@@ -224,6 +224,7 @@ async def optimize_product(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
 # --- SHOPIFY SYNC ENDPOINT ---
 SHOPIFY_DOMAIN = re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$")
 
@@ -243,20 +244,30 @@ async def trigger_shopify_sync(
     user_id: str = Depends(get_current_user_id),
 ):
     integration = await run_sync_io(
-        lambda: supabase.table("integrations_safe")
+        lambda: supabase.table("integrations")
         .select("shop_url, access_token, shop_name")
         .eq("user_id", user_id)
         .eq("provider", "shopify")
-        .is_("uninstalled_at", "null")
-        .single()
+        .is_("uninstalled_at", None)
+        .limit(1)
         .execute()
     )
-    row = integration.data
+    row = integration.data[0] if integration.data else None
     if not row:
         raise HTTPException(404, "No active Shopify integration")
 
     shop_url = validate_shopify_domain(row["shop_url"])
-    access_token = row["access_token"]
+    encrypted_token = row.get("access_token", "")
+    if not encrypted_token:
+        raise HTTPException(404, "No access token found for Shopify integration")
+
+    decrypted_res = await run_sync_io(
+        lambda: supabase.rpc("decrypt_shopify_token", {"p_ciphertext_b64": encrypted_token}).execute()
+    )
+    access_token = decrypted_res.data
+    if not access_token:
+        raise HTTPException(500, "Failed to decrypt Shopify access token")
+
     print(f"🔄 [Sync API] Sync for user {user_id} ({shop_url})")
 
     async def run_sync_task():
