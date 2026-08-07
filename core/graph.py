@@ -1232,10 +1232,11 @@ async def mark_needs_optimization(state: KatalogState) -> dict[str, Any]:
             .execute()
         )
 
-        # El Escritor y el Juez ya gastaron API real — se comete el crédito reservado.
-        await _commit_reservation(state, "needs_optimization")
+        # El crítico no aprobó: no hay entregable, no se cobra.
+        # El costo de tokens lo absorbe el negocio, no el cliente.
+        await _refund_reservation(state, "needs_optimization")
 
-        print(f"🟠 [Nodo 5B] Producto {product_id} marcado como NEEDS_OPTIMIZATION.")
+        print(f"🟠 [Nodo 5B] Producto {product_id} marcado como NEEDS_OPTIMIZATION (crédito devuelto).")
         return {"status": STATUS_NEEDS_OPTIMIZATION}
     except Exception as e:
         error_message = str(e)
@@ -1349,10 +1350,9 @@ async def error_handler(state: KatalogState) -> dict[str, Any]:
 
     if reservation_id and user_id:
         try:
-            if writer_invoked:
-                await _commit_reservation(state, "late_failure")
-            else:
-                await _refund_reservation(state, "early_failure")
+            # Falle temprano o tarde, si no se publicó no se cobra.
+            # Un crash del pipeline es un fallo nuestro, no un servicio prestado.
+            await _refund_reservation(state, "pipeline_failure")
         except Exception as billing_error:
             print(f"⚠️ [Billing] Error ajustando créditos tras fallo: {billing_error}")
 
