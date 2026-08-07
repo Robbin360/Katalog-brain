@@ -21,7 +21,9 @@ from core.helpers import (
     load_skills,
     get_available_skills,
     build_product_fingerprint,
+    utc_now_iso,
 )
+from core.quality_gate import evaluate_rewrite
 from core.schemas import BrandRules, ProductContext, OrchestratorPlan
 from core.shopify_tools import publish_to_shopify as publish_product_to_shopify
 from core.shopify_api import get_product_taxonomy
@@ -1107,7 +1109,7 @@ def should_continue(state: KatalogState) -> str:
 # 💾 NODO 5: GUARDAR READY_TO_PUBLISH
 # ==========================================
 async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
-    print("💾 [Nodo 5] Guardando propuesta aprobada en Supabase...")
+    print("💾 [Nodo 5] Guardando propuesta y ejecutando quality gate...")
     proposal = state.get("final_proposal")
 
     if state.get("error"):
@@ -1117,28 +1119,82 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
 
     try:
         proposal_dict = _proposal_to_dict(proposal)
-        score = proposal_dict.get("audit_score", 80)
-        audit_log_data = proposal_dict.get("audit_log", [])
+        proposal_dict.pop("audit_score", None)  # el escritor ya no se autocalifica
+        audit_log_data = list(proposal_dict.get("audit_log", []))
 
-        await _run_sync(lambda: supabase.table("shopify_products").update({
+        # Obtener texto original del estado (cargado en Nodo 1 vía product_context)
+        context = state.get("product_context")
+        if context and isinstance(context, ProductContext):
+            old_title = context.current_title
+            old_body_html = context.current_body_html
+        elif context and isinstance(context, dict):
+            old_title = context.get("current_title", "")
+            old_body_html = context.get("current_body_html", "")
+        else:
+            old_title, old_body_html = "", ""
+
+        verdict = await evaluate_rewrite(
+            old_title=old_title,
+            old_body_html=old_body_html,
+            new_title=proposal_dict.get("new_title"),
+            new_body_html=proposal_dict.get("new_body_html"),
+        )
+        audit_log_data.append(verdict.as_log_line())
+        print(f"⚖️ [Gate] {verdict.as_log_line()}")
+
+        next_status = STATUS_READY_TO_PUBLISH if verdict.passed else STATUS_NEEDS_OPTIMIZATION
+
+        # Leer consecutive_failures actual de la fila (necesario para incrementar)
+        cf_res = await _run_sync(
+            lambda: supabase.table("shopify_products")
+            .select("consecutive_failures")
+            .eq("id", state["product_id"])
+            .single()
+            .execute()
+        )
+        current_cf = (cf_res.data or {}).get("consecutive_failures") or 0
+
+        update_payload: dict[str, Any] = {
             "ai_proposal": proposal_dict,
-            "audit_score": score,
+            "audit_score": verdict.new_score,
             "audit_log": audit_log_data,
-            "audit_status": STATUS_READY_TO_PUBLISH,
+            "audit_status": next_status,
+            "last_audit_at": utc_now_iso(),
             "error_log": None,
             "retry_attempts": 0,
             "next_retry_at": None,
-        }).eq("id", state["product_id"]).execute())
+        }
 
-        # ✅ Único punto de cobro en el camino exitoso: el LLM ya trabajó y
-        # el Juez ya aprobó. Publicar después (ahora o en una semana) es gratis.
-        await _commit_reservation(state, "optimization_complete")
+        if verdict.passed:
+            update_payload["consecutive_failures"] = 0
+        else:
+            update_payload["consecutive_failures"] = current_cf + 1
+            update_payload["last_failure_at"] = utc_now_iso()
 
-        print("✅ [Nodo 5] Propuesta guardada y crédito comprometido.")
-        return {"status": STATUS_READY_TO_PUBLISH, "retry_attempts": 0}
+        await _run_sync(
+            lambda: supabase.table("shopify_products")
+            .update(update_payload)
+            .eq("id", state["product_id"])
+            .execute()
+        )
+
+        if verdict.passed:
+            # 💰 Único punto de cobro: el LLM ya trabajó y el gate aprobó.
+            # Publicar después (ahora o en una semana) es gratis.
+            await _commit_reservation(state, "optimization_complete")
+            print("   [Nodo 5] Propuesta guardada, gate aprobado, crédito comprometido.")
+            return {"status": STATUS_READY_TO_PUBLISH, "retry_attempts": 0}
+        else:
+            # Gate rechazó: no hay entregable, no se cobra.
+            # El costo de tokens lo absorbe el negocio: es un fallo de
+            # calidad nuestro, no un servicio prestado al cliente.
+            await _refund_reservation(state, "gate_rejected")
+            print(f"  [Nodo 5] Gate rechazó (delta={verdict.delta}). Crédito devuelto, marcado NEEDS_OPTIMIZATION.")
+            return {"status": STATUS_NEEDS_OPTIMIZATION, "retry_attempts": 0}
+
     except Exception as e:
         error_message = _format_error_for_log(e)
-        print(f"❌ [Nodo 5] Error guardando propuesta: {error_message}")
+        print(f"❌ [Nodo 5] Error en gate/guardado: {error_message}")
         return {"error": error_message}
 
 
@@ -1162,8 +1218,11 @@ async def mark_needs_optimization(state: KatalogState) -> dict[str, Any]:
 
         if proposal:
             proposal_dict = _proposal_to_dict(proposal)
+            proposal_dict.pop("audit_score", None)  # el escritor ya no se autocalifica
             update_data["ai_proposal"] = proposal_dict
-            update_data["audit_score"] = proposal_dict.get("audit_score", 0)
+            # audit_score NO se toca aquí: este nodo es el camino de error del Critic
+            # (iteraciones excedidas), no tiene gate independiente. El score se mantendrá
+            # como el que dejó el gate si ya corrió, o 0 por default de la columna.
             update_data["audit_log"] = proposal_dict.get("audit_log", [])
 
         await _run_sync(

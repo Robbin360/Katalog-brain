@@ -53,6 +53,7 @@ primary_critic = Agent(
     retries=MAX_RETRIES,
     output_retries=MAX_RETRIES,
     defer_model_check=True,
+     model_settings={"temperature": 0},   
     system_prompt=(
         "You are a $100B SaaS Quality Auditor. "
         "Your logic is binary: PERFECT or FAILED. "
@@ -68,6 +69,7 @@ fallback_critic = Agent(
     retries=MAX_RETRIES,
     output_retries=MAX_RETRIES,
     defer_model_check=True,
+     model_settings={"temperature": 0},   
     system_prompt=(
         "You are a strict QA checker for Shopify product copy. "
         "Return FAILED unless all brand rules, forbidden-word rules, and SEO constraints pass. "

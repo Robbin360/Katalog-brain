@@ -21,7 +21,6 @@ class AIProposalOutput(BaseModel):
     new_title: str = Field(..., max_length=70, description="SEO optimized title. Max 70 characters.")
     new_body_html: str = Field(..., min_length=80, description="High conversion HTML description using <ul> and <strong> tags.")
     seo_tags: str = Field(..., description="Comma separated SEO keywords.")
-    audit_score: int = Field(..., ge=0, le=100)
     audit_log: List[str] = Field(..., min_length=1, description="Specific reasons for changes.")
 
 class CriticFeedback(BaseModel):

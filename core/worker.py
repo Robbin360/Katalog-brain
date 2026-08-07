@@ -5,8 +5,9 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import stripe
-from agents.inspector_agent import inspector_agent
+from agents.inspector_agent import inspector_agent, build_inspector_prompt
 from core.graph import katalog_agent, supabase
+from core.helpers import utc_now_iso
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
@@ -292,7 +293,7 @@ async def auto_pilot_patrol() -> None:
                         continue
                     
                     print(f"👀 [Auto-Triaje] Evaluando: {title[:30]}...")
-                    prompt = f"Title: {title}\nDescription: {body_html}"
+                    prompt = build_inspector_prompt(title, body_html)
                     
                     # Llamamos al inspector_agent de forma asíncrona
                     result = await inspector_agent.run(prompt)
@@ -308,6 +309,7 @@ async def auto_pilot_patrol() -> None:
                         .update({
                             "seo_score_initial": s,
                             "audit_score": s,
+                            "last_audit_at": utc_now_iso(),
                             "error_log": r,
                             "audit_status": st,
                             "updated_at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')

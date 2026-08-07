@@ -11,6 +11,19 @@ from typing import Union
 from supabase import create_client, Client
 
 # Fix for WinError 10035 (WSAEWOULDBLOCK) on Windows with parallel async sockets.
+import os
+import re
+import asyncio
+import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, AliasChoices
+from typing import Union
+from supabase import create_client, Client
+
+# Fix for WinError 10035 (WSAEWOULDBLOCK) on Windows with parallel async sockets.
 # The default ProactorEventLoop has issues with non-blocking sockets in
 # parallel async contexts. WindowsSelectorEventLoopPolicy uses select()
 # instead of IOCP, which is more compatible. Linux/macOS are unaffected.
@@ -18,8 +31,9 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from core.graph import katalog_agent
-from agents.inspector_agent import inspector_agent
+from agents.inspector_agent import inspector_agent, build_inspector_prompt
 from core.auth import get_current_user_id
+from core.helpers import utc_now_iso
 
 
 @asynccontextmanager
@@ -100,7 +114,7 @@ async def process_triage_queue():
 
         # 2. Auditar cada producto controlando la velocidad
         for prod in products:
-            prompt = f"Title: {prod.get('current_title')}\nDescription: {prod.get('current_body_html')}"
+            prompt = build_inspector_prompt(prod.get('current_title'), prod.get('current_body_html'))
             
             print(f"👀 Auditando: {prod.get('current_title')[:30]}...")
             
@@ -120,16 +134,12 @@ async def process_triage_queue():
                     supabase.table('shopify_products').update({
                         'seo_score_initial': s,
                         'audit_score': s,
+                        'last_audit_at': utc_now_iso(),
                         'error_log': r,
                         'audit_status': ns,
                     }).eq('id', pid).execute()
                 await asyncio.to_thread(_update)
             await _save_audit()
-            
-            print(f"✅ Score: {audit_data.score}/100 | Motivo: {audit_data.reason}")
-            
-            # 🛑 EL FRENO DE MANO (Rate Limit Bypass)
-            # Pausamos 15 segundos para no enfadar a Google (Límite: 5 por minuto)
             print("⏳ Enfriando motor por 15 segundos para evitar ban de API...")
             await asyncio.sleep(15)
 

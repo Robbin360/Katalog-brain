@@ -7,10 +7,20 @@ import hashlib
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def utc_now_iso() -> str:
+    """Timestamp ISO-8601 con zona, apto para columnas timestamptz via PostgREST.
+
+    IMPORTANTE: nunca uses el string "now()" en un dict de update de supabase-py.
+    PostgREST lo entrega como literal de texto y Postgres no lo evalúa como función.
+    """
+    return datetime.now(timezone.utc).isoformat()
 
 # Ruta absoluta a la carpeta skills/ (relativa a este archivo)
 SKILLS_DIR = Path(__file__).parent.parent / "skills"
