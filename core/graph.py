@@ -639,11 +639,25 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
 
     taxonomy_injection = ""
     if taxonomy_context:
-        taxonomy_injection = f"""
+        if "Atributos" in taxonomy_context:
+            # Solo cuando la taxonomía trae atributos CON VALORES verificados
+            # (iteración 2: values/name emitidos por Shopify). Un bloque de
+            # requisitos con solo nombres empujaría al escritor a inventarlos.
+            taxonomy_injection = f"""
     ## REQUISITOS TAXONÓMICOS DE SHOPIFY (MANDATORIOS PARA GOOGLE SHOPPING)
     {taxonomy_context}
     INSTRUCCIÓN: Integra cada atributo entre corchetes como prosa natural
     dentro del framework FAB/PAS. Nunca como lista técnica separada.
+    Los valores vienen del catálogo de Shopify: están verificados por definición.
+"""
+        else:
+            # Solo categoría: un hecho real del catálogo. Sirve de contexto,
+            # nunca como exigencia de integrar dimensiones sin datos.
+            taxonomy_injection = f"""
+    ## CONTEXTO DE CATEGORÍA SHOPIFY
+    {taxonomy_context}
+    Esta categoría es un dato emitido por Shopify: úsala para definir QUÉ es
+    el producto, no para inventar especificaciones que falten en el dossier.
 """
     elif not taxonomy_available:
         taxonomy_injection = """
