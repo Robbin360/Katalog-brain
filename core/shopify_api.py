@@ -49,8 +49,10 @@ async def get_product_taxonomy(
     #   - TaxonomyAttribute: solo id (NO tiene name)
     #   - TaxonomyChoiceListAttribute: id, name, values (TaxonomyValueConnection)
     #   - TaxonomyMeasurementAttribute: id, name, options (LIST de Attribute)
-    # Versión conservadora: solo id/name. Los valores (values/options) van en
-    # una segunda iteración con esta introspección en mano.
+    # De momento SOLO se devuelve el fullName de la categoría: los atributos sin
+    # valores no se inyectan (empujan a inventar). La query sigue pidiendo los
+    # nombres para la iteración 2, cuando values/options (emitidos por Shopify)
+    # den valores verificados que sí se puedan inyectar.
     product_query = """
     query GetProductTaxonomy($id: ID!) {
       product(id: $id) {
@@ -139,23 +141,21 @@ async def get_product_taxonomy(
             print("ℹ️ [shopify_api] Producto no tiene categoría asignada.")
             return ("", True)
 
-        category_fullname = category.get("fullName") or category.get("id")
+        category_fullname = category.get("fullName")
+        if not category_fullname:
+            print("ℹ️ [shopify_api] Categoría sin fullName legible. Sin contexto taxonómico.")
+            return ("", True)
 
-        attr_nodes = category.get("attributes", {}).get("nodes", [])
-
-        formatted_attrs = []
-        for node in attr_nodes:
-            attr_name = node.get("name")
-            if not attr_name:
-                continue
-            # Versión conservadora: solo nombres de atributos. Los valores
-            # concretos (choices/measurements) van en una segunda iteración.
-            formatted_attrs.append(f"- [{attr_name}]")
-
+        # Los nombres de atributos SIN valores no se inyectan: no aportan hechos
+        # verificados y empujan al escritor a inventarlos, que es lo que el
+        # crítico rechaza. Cuando la iteración 2 traiga TaxonomyValue.name y
+        # las opciones de TaxonomyMeasurementAttribute (valores emitidos por
+        # Shopify, verificados por definición), ahí sí se inyectan.
         prompt_text = f"Categoría Shopify: \"{category_fullname}\""
-        if formatted_attrs:
-            prompt_text += "\nAtributos requeridos:\n" + "\n".join(formatted_attrs)
 
+        # La categoría sola es un hecho real del catálogo: le dice al escritor
+        # qué es el producto sin inducir inventos (contradice la doctrina de
+        # "no hay datos → NO pedir ser específico" del orquestador).
         return (prompt_text, True)
 
     except Exception as e:
