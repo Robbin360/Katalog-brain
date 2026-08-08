@@ -496,6 +496,7 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
         shopify_id = str(product_data.get("shopify_id") or "")
         taxonomy_text = ""
         taxonomy_ok = True
+        taxonomy_attrs: list[str] = []
 
         if shopify_id:
             try:
@@ -518,11 +519,28 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
                     access_token = decrypted_res.data
 
                     if access_token:
-                        taxonomy_text, taxonomy_ok = await get_product_taxonomy(
+                        tax_res = await get_product_taxonomy(
                             shopify_numeric_id=shopify_id,
                             shop_domain=shop_domain,
                             access_token=access_token
                         )
+                        taxonomy_ok = tax_res.api_ok
+                        taxonomy_attrs = tax_res.attributes_with_values
+
+                        # Estructura, no prosa interpretada: el Nodo 3 decide
+                        # usando taxonomy_attributes (sin sniffing de strings).
+                        if tax_res.has_verified_attributes:
+                            attrs_lines = "\n".join(
+                                f"- [{a}]" for a in tax_res.attributes_with_values[:50]
+                            )
+                            taxonomy_text = (
+                                f'Categoría Shopify: "{tax_res.category_name}"'
+                                f"\nAtributos requeridos:\n{attrs_lines}"
+                            )
+                        elif tax_res.category_name:
+                            taxonomy_text = f'Categoría Shopify: "{tax_res.category_name}"'
+                        else:
+                            taxonomy_text = ""
             except Exception as e:
                 print(f"⚠️ [Nodo 1] Error obteniendo taxonomía: {e}")
                 taxonomy_ok = False
@@ -536,6 +554,7 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
             "brand_rules": rules,
             "taxonomy_context": taxonomy_text,
             "taxonomy_available": taxonomy_ok,
+            "taxonomy_attributes": taxonomy_attrs,
         }
         if _has_proposal(stored_proposal):
             update_data["final_proposal"] = stored_proposal
@@ -636,24 +655,27 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
 
     taxonomy_context = state.get("taxonomy_context", "")
     taxonomy_available = state.get("taxonomy_available", True)
+    # Atributos CON valores verificados (iteración 2, emitidos por Shopify).
+    # Estructura del contrato TaxonomyResult — el sniffing de strings queda
+    # prohibido aquí: la rama decide por la lista, no por lo que diga el texto.
+    taxonomy_attrs = state.get("taxonomy_attributes", [])
 
     taxonomy_injection = ""
-    if taxonomy_context:
-        if "Atributos" in taxonomy_context:
-            # Solo cuando la taxonomía trae atributos CON VALORES verificados
-            # (iteración 2: values/name emitidos por Shopify). Un bloque de
-            # requisitos con solo nombres empujaría al escritor a inventarlos.
-            taxonomy_injection = f"""
+    if taxonomy_attrs:
+        # Solo se inyecta el bloque de requisitos cuando hay atributos con
+        # valores verificados. Un bloque con solo nombres empujaría al
+        # escritor a inventarlos (justo lo que el crítico rechaza).
+        taxonomy_injection = f"""
     ## REQUISITOS TAXONÓMICOS DE SHOPIFY (MANDATORIOS PARA GOOGLE SHOPPING)
     {taxonomy_context}
     INSTRUCCIÓN: Integra cada atributo entre corchetes como prosa natural
     dentro del framework FAB/PAS. Nunca como lista técnica separada.
     Los valores vienen del catálogo de Shopify: están verificados por definición.
 """
-        else:
-            # Solo categoría: un hecho real del catálogo. Sirve de contexto,
-            # nunca como exigencia de integrar dimensiones sin datos.
-            taxonomy_injection = f"""
+    elif taxonomy_context:
+        # Solo categoría: un hecho real del catálogo. Sirve de contexto,
+        # nunca como exigencia de integrar dimensiones sin datos.
+        taxonomy_injection = f"""
     ## CONTEXTO DE CATEGORÍA SHOPIFY
     {taxonomy_context}
     Esta categoría es un dato emitido por Shopify: úsala para definir QUÉ es

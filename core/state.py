@@ -46,8 +46,9 @@ class KatalogState(TypedDict, total=False):
     description_length: NotRequired[int]
 
     # Taxonomía Predictiva de Shopify
-    taxonomy_context: NotRequired[str]
-    taxonomy_available: NotRequired[bool]
+    taxonomy_context: NotRequired[str]             # prosa lista para el prompt (categoría ± atributos)
+    taxonomy_available: NotRequired[bool]          # api_ok de la consulta (False = falló la API)
+    taxonomy_attributes: NotRequired[list[str]]    # atributos CON valores verificados; vacío hoy (iteración 2)
 
     # ─── CAPA DEL ORQUESTADOR (NUEVOS CAMPOS) ────────────────────────────────
     # Clasificación determinista del producto (sin LLM)

@@ -1,9 +1,31 @@
 import asyncio
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 import httpx
 
 SHOPIFY_API_VERSION = "2026-04"
+
+@dataclass
+class TaxonomyResult:
+    """Resultado estructurado de la consulta de taxonomía de Shopify.
+
+    Contrato del consumidor (graph.py): sin parsing, sin sniffing de strings.
+    category_name: fullName legible de la categoría ("" si no hay categoría).
+    attributes_with_values: atributos CUYOS valores están verificados y
+        emitidos por Shopify (iteración 2: TaxonomyValue.name / opciones de
+        medición). Hoy siempre vacío: la query conservadora no trae valores.
+    api_ok: la llamada a la API terminó bien (False = fallo de red/query/parse).
+        Distingue "no hay dato aprovechable" (True) de "el sistema falló" (False).
+    """
+    category_name: str = ""
+    attributes_with_values: list[str] = field(default_factory=list)
+    api_ok: bool = False
+
+    @property
+    def has_verified_attributes(self) -> bool:
+        """True solo si hay atributos con valores verificados (iteración 2)."""
+        return bool(self.attributes_with_values)
 
 def _numeric_id_to_gid(numeric_id: str) -> str:
     """
@@ -27,16 +49,16 @@ async def get_product_taxonomy(
     shopify_numeric_id: str,
     shop_domain: str,
     access_token: str,
-) -> tuple[str, bool]:
+) -> TaxonomyResult:
     """
     Consulta la categoría y atributos de taxonomía predictiva de Shopify para un producto.
-    Retorna (prompt_text, success_flag).
+    Retorna TaxonomyResult (estructura, no prosa). El llamador arma el prompt.
     Implementa retry con exponential backoff para HTTP 429 y Timeout. Max 3 intentos.
-    Nunca lanza excepciones, retorna ("", False) si falla.
+    Nunca lanza excepciones: retorna TaxonomyResult(api_ok=False) si falla.
     """
     if not shopify_numeric_id or not shop_domain or not access_token:
         print("⚠️ [shopify_api] get_product_taxonomy recibió parámetros vacíos.")
-        return ("", False)
+        return TaxonomyResult(api_ok=False)
 
     product_gid = _numeric_id_to_gid(shopify_numeric_id)
     normalized_shop_domain = _normalize_shop_url(shop_domain)
@@ -128,39 +150,38 @@ async def get_product_taxonomy(
 
         if product_res.get("errors"):
             print(f"❌ [shopify_api] Errores GraphQL en GetProductTaxonomy: {product_res['errors']}")
-            return ("", False)
+            return TaxonomyResult(api_ok=False)
 
         product_data = product_res.get("data", {}).get("product")
         if not product_data:
             print("⚠️ [shopify_api] Producto no encontrado en Shopify.")
-            return ("", False)
+            return TaxonomyResult(api_ok=False)
 
         category = product_data.get("category")
         if not category:
             # Producto no tiene categoría asignada en Shopify (Caso C)
             print("ℹ️ [shopify_api] Producto no tiene categoría asignada.")
-            return ("", True)
+            return TaxonomyResult(api_ok=True)
 
         category_fullname = category.get("fullName")
         if not category_fullname:
             print("ℹ️ [shopify_api] Categoría sin fullName legible. Sin contexto taxonómico.")
-            return ("", True)
+            return TaxonomyResult(api_ok=True)
 
-        # Los nombres de atributos SIN valores no se inyectan: no aportan hechos
-        # verificados y empujan al escritor a inventarlos, que es lo que el
-        # crítico rechaza. Cuando la iteración 2 traiga TaxonomyValue.name y
-        # las opciones de TaxonomyMeasurementAttribute (valores emitidos por
-        # Shopify, verificados por definición), ahí sí se inyectan.
-        prompt_text = f"Categoría Shopify: \"{category_fullname}\""
-
-        # La categoría sola es un hecho real del catálogo: le dice al escritor
-        # qué es el producto sin inducir inventos (contradice la doctrina de
-        # "no hay datos → NO pedir ser específico" del orquestador).
-        return (prompt_text, True)
+        # Los atributos SIN valores verificados no viajan al consumidor: no
+        # aportan hechos y empujan al escritor a inventarlos. Cuando la
+        # iteración 2 traiga TaxonomyValue.name / opciones de medición
+        # (emitidos por Shopify, verificados por definición), se rellenan en
+        # attributes_with_values y has_verified_attributes pasa a True.
+        return TaxonomyResult(
+            category_name=category_fullname,
+            attributes_with_values=[],
+            api_ok=True,
+        )
 
     except Exception as e:
         print(f"❌ [shopify_api] Error en get_product_taxonomy: {e}")
-        return ("", False)
+        return TaxonomyResult(api_ok=False)
 
 
 # --- SHOPIFY PAGINATION + THROTTLE + RESUME + UPSERT (FIX 16) ---
