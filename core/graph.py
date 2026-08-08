@@ -1404,10 +1404,30 @@ def route_after_knowledge(state: KatalogState) -> str:
 
 
 def route_after_save(state: KatalogState) -> str:
+    """Decide si el producto merece publicarse tras el quality gate (Nodo 5).
+
+    El gate puntúa el texto viejo y el nuevo con el mismo juez en la misma
+    corrida. Si el nuevo no lo supera por el margen mínimo, save_to_supabase
+    escribe NEEDS_OPTIMIZATION y devuelve el crédito, y su retorno se mergea
+    en el estado. Lista blanca: solo READY_TO_PUBLISH publica; cualquier otro
+    status bloquea (fallo cerrado: el default es no escribir en la tienda).
+
+    Sin esta guarda, la arista condicional anterior publicaba con solo
+    auto_pilot_enabled, ignorando el veredicto del gate. Verificado en
+    producción el 2026-08-08 con los productos 1009 (delta -20) y 998.
+    """
     if state.get("error"):
         return "error_handler"
-    if state.get("auto_pilot_enabled", False):
+
+    status = state.get("status")
+
+    if (
+        state.get("auto_pilot_enabled", False)
+        and status == STATUS_READY_TO_PUBLISH
+    ):
         return "publish_to_shopify"
+
+    print(f"🛑 [Enrutador] Publicación bloqueada (status={status}). No se publica.")
     return "end"
 
 
