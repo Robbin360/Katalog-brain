@@ -41,6 +41,15 @@ STATUS_NEEDS_OPTIMIZATION = "NEEDS_OPTIMIZATION"
 STATUS_READY_TO_PUBLISH = "READY_TO_PUBLISH"
 STATUS_OPTIMIZED = "OPTIMIZED"
 STATUS_ERROR = "ERROR"
+STATUS_NEEDS_REVIEW = "NEEDS_REVIEW"
+
+# ⚠️ VIVE EN DOS SISTEMAS: debe coincidir con la guarda del trigger
+# check_product_health en Supabase (fn_check_product_health usa
+# coalesce(NEW.consecutive_failures, 0) < 3). Si el código escalara a
+# NEEDS_REVIEW ANTES de llegar a este número, el trigger volvería a encolar
+# el producto a un estado que el Auto-Pilot ya no toma. Si cambias este
+# número, cambia también el SQL de la migración 20260806000000.
+MAX_GATE_FAILURES = 3
 
 # ─── Cuadrantes del Candado Do-Not-Harm ──────────────────────────────────────
 QUADRANT_NEEDS_OPT      = "NEEDS_OPTIMIZATION"
@@ -1190,6 +1199,20 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
         )
         current_cf = (cf_res.data or {}).get("consecutive_failures") or 0
 
+        if verdict.passed:
+            next_cf = 0
+            next_status = STATUS_READY_TO_PUBLISH
+        else:
+            next_cf = current_cf + 1
+            # Escalar al tercer rechazo seguido: el circuito deja de re-encolar
+            # y pasa a revisión humana. Sin esto el producto quedaría encolado
+            # para siempre (el trigger re-encola mientras cf < MAX_GATE_FAILURES).
+            next_status = (
+                STATUS_NEEDS_REVIEW
+                if next_cf >= MAX_GATE_FAILURES
+                else STATUS_NEEDS_OPTIMIZATION
+            )
+
         update_payload: dict[str, Any] = {
             "ai_proposal": proposal_dict,
             "audit_score": verdict.new_score,
@@ -1199,12 +1222,10 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
             "error_log": None,
             "retry_attempts": 0,
             "next_retry_at": None,
+            "consecutive_failures": next_cf,
         }
 
-        if verdict.passed:
-            update_payload["consecutive_failures"] = 0
-        else:
-            update_payload["consecutive_failures"] = current_cf + 1
+        if not verdict.passed:
             update_payload["last_failure_at"] = utc_now_iso()
 
         await _run_sync(
@@ -1225,8 +1246,8 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
             # El costo de tokens lo absorbe el negocio: es un fallo de
             # calidad nuestro, no un servicio prestado al cliente.
             await _refund_reservation(state, "gate_rejected")
-            print(f"  [Nodo 5] Gate rechazó (delta={verdict.delta}). Crédito devuelto, marcado NEEDS_OPTIMIZATION.")
-            return {"status": STATUS_NEEDS_OPTIMIZATION, "retry_attempts": 0}
+            print(f"  [Nodo 5] Gate rechazó (delta={verdict.delta}). Crédito devuelto, marcado {next_status}.")
+            return {"status": next_status, "retry_attempts": 0}
 
     except Exception as e:
         error_message = _format_error_for_log(e)
@@ -1245,11 +1266,31 @@ async def mark_needs_optimization(state: KatalogState) -> dict[str, Any]:
     error_log = "; ".join(issues)
 
     try:
+        # Contador primero: el fallo del bucle del crítico es también un fallo
+        # de producción de la IA. Si no contara, un producto que siempre falla
+        # por este camino quedaría en loop infinito sin llegar a revisión humana.
+        cf_res = await _run_sync(
+            lambda: supabase.table("shopify_products")
+            .select("consecutive_failures")
+            .eq("id", product_id)
+            .single()
+            .execute()
+        )
+        current_cf = (cf_res.data or {}).get("consecutive_failures") or 0
+        next_cf = current_cf + 1
+        next_status = (
+            STATUS_NEEDS_REVIEW
+            if next_cf >= MAX_GATE_FAILURES
+            else STATUS_NEEDS_OPTIMIZATION
+        )
+
         update_data: dict[str, Any] = {
-            "audit_status": STATUS_NEEDS_OPTIMIZATION,
+            "audit_status": next_status,
             "error_log": error_log,
             "retry_attempts": MAX_CRITIC_ATTEMPTS,
             "next_retry_at": None,
+            "consecutive_failures": next_cf,
+            "last_failure_at": utc_now_iso(),
         }
 
         if proposal:
@@ -1272,8 +1313,8 @@ async def mark_needs_optimization(state: KatalogState) -> dict[str, Any]:
         # El costo de tokens lo absorbe el negocio, no el cliente.
         await _refund_reservation(state, "needs_optimization")
 
-        print(f"🟠 [Nodo 5B] Producto {product_id} marcado como NEEDS_OPTIMIZATION (crédito devuelto).")
-        return {"status": STATUS_NEEDS_OPTIMIZATION}
+        print(f"🟠 [Nodo 5B] Producto {product_id} marcado como {next_status} (crédito devuelto).")
+        return {"status": next_status}
     except Exception as e:
         error_message = str(e)
         print(f"❌ [Nodo 5B] Error marcando NEEDS_OPTIMIZATION: {error_message}")
