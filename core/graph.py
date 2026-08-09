@@ -43,12 +43,13 @@ STATUS_OPTIMIZED = "OPTIMIZED"
 STATUS_ERROR = "ERROR"
 STATUS_NEEDS_REVIEW = "NEEDS_REVIEW"
 
-# ⚠️ VIVE EN DOS SISTEMAS: debe coincidir con la guarda del trigger
-# check_product_health en Supabase (fn_check_product_health usa
-# coalesce(NEW.consecutive_failures, 0) < 3). Si el código escalara a
-# NEEDS_REVIEW ANTES de llegar a este número, el trigger volvería a encolar
-# el producto a un estado que el Auto-Pilot ya no toma. Si cambias este
-# número, cambia también el SQL de la migración 20260806000000.
+# ⚠️ VIVE EN DOS SISTEMAS: debe coincidir con la guarda de los triggers
+# check_product_health_ins y check_product_health_upd en Supabase (ambos usan
+# coalesce(NEW.consecutive_failures, 0) < 3 en su WHEN y disparan
+# trigger_auto_audit()). Si el código escalara a NEEDS_REVIEW ANTES de llegar
+# a este número, los triggers volverían a encolar el producto a un estado que
+# el Auto-Pilot ya no toma. Si cambias este número, cambia también la
+# migración 20260806000000 (fuente de verdad: la base, no el archivo).
 MAX_GATE_FAILURES = 3
 
 # ─── Cuadrantes del Candado Do-Not-Harm ──────────────────────────────────────
