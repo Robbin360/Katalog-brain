@@ -93,4 +93,9 @@ async def publish_to_shopify(
     if not product:
         raise RuntimeError("Shopify did not return an updated product")
 
+    returned_title = (product or {}).get("title", "")
+    if returned_title != title:
+        print(f"🔴 [Shopify] Respuesta completa: {response_data}")
+        raise RuntimeError(f"Shopify aceptó la mutación pero el título no cambió. Enviado: {title!r}. Devuelto: {returned_title!r}.")
+
     return product
