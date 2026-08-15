@@ -11,6 +11,9 @@ maximizar. Una métrica que se maximiza se explota (Ley de Goodhart):
 si "más corto = más puntos", el writer converge a "Tabla Pro".
 Por eso casi todo aquí son bandas con piso Y techo, no solo un mínimo.
 
+CALIBRADO CONTRA EL CATÁLOGO REAL (18 productos, 2026-08-15):
+la primera versión rechazaba 17 de 18. Ver notas en cada umbral.
+
 Fuentes:
 - Escala INFLESZ (adaptación española de Flesch-Szigriszt), validada
   sobre 210 textos aleatorios: Barrio-Cantalejo et al., "Validación de
@@ -285,8 +288,25 @@ PIXEL_TRUNCATION_RISK_THRESHOLD = 600  # ver Zyppy: ~580-600px desktop
 TITLE_MIN_LENGTH = 40  # regla de producto propuesta, NO estándar externo
 TITLE_MAX_LENGTH = 70  # coincide con schemas.py:AIProposalOutput (existente)
 BODY_MIN_WORDS = 25    # regla de producto propuesta, NO estándar externo
-MAX_STUFFING_RATIO = 0.08
+
+# Stuffing: 15% tras medir el catálogo real. Al 8% se marcaba 'snowboard'
+# en productos de snowboard, es decir la palabra de la categoría. Falso
+# positivo garantizado en catálogos de nicho.
+MAX_STUFFING_RATIO = 0.15
 MIN_STUFFING_COUNT = 5
+
+# INFLESZ es INFORMATIVO, no eliminatorio.
+#
+# Por qué cambió: medido contra los 18 productos reales, el umbral de 55
+# rechazaba 10 de 18, incluido el mejor texto del catálogo (id 1009, que
+# saca 31.4). El paper de Barrio-Cantalejo fija ese mínimo explícitamente
+# "en el caso de textos sobre salud"; en ese mismo estudio las revistas
+# científicas promediaron 37.9. El español técnico de e-commerce es
+# polisilábico ("resistencia" 4 sílabas, "maniobrabilidad" 6), así que
+# cae estructuralmente en la banda 40-55. Usarlo como puerta castigaba
+# precisión técnica, que es justo lo que queremos premiar.
+#
+# Se conserva medido y reportado para detectar tendencias, no para vetar.
 ACCEPTABLE_INFLESZ_BANDS = {"normal", "bastante_facil", "muy_facil"}
 
 
@@ -374,10 +394,10 @@ def evaluate_deterministic(
             "texto genérico tipo 'Tabla Pro'."
         )
 
+    # Legibilidad: se mide y se reporta, pero NO reprueba. Ver comentario
+    # en ACCEPTABLE_INFLESZ_BANDS.
     inflesz = flesch_szigriszt_inflesz(body_text)
     band = inflesz_band(inflesz)
-    if word_count_ok and band not in ACCEPTABLE_INFLESZ_BANDS and band != "indeterminado":
-        failures.append(f"Legibilidad INFLESZ fuera de rango aceptable: {band} ({inflesz:.1f}).")
 
     top_word, stuffing_ratio = keyword_stuffing_ratio(body_text)
     stuffing_count = int(stuffing_ratio * max(word_count, 1))
