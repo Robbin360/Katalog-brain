@@ -426,3 +426,55 @@ def evaluate_deterministic(
         keyword_stuffing_flag=stuffing_flag,
         failures=failures,
     )
+
+    
+    # ─────────────────────────────────────────────────────────────────────
+# 9. PORCENTAJE PARA LA COLUMNA audit_score
+# ─────────────────────────────────────────────────────────────────────
+#
+# La columna shopify_products.audit_score alimenta refresh_user_kpis
+# (health_score_avg), get_priority_products (prioridad = stock*precio *
+# (100-score)/100) y el dashboard. Antes la llenaba el inspector con una
+# escala 0-100 sin calibrar; medido contra el catálogo real, esos valores
+# estaban invertidos (el peor título del catálogo sacó 95).
+#
+# Este reemplazo es una SUMA DE CHECKS VERIFICABLES, no una opinión. Los
+# pesos son una decisión de producto, no un estándar externo: lo
+# defendible es que cada punto se rastrea a una comprobación concreta y
+# que el resultado es idéntico en cada corrida.
+
+QUALITY_WEIGHTS = {
+    "title_length_ok": 25,
+    "body_word_count_ok": 20,
+    "has_structural_elements": 15,
+    "no_forbidden_words": 10,
+    "no_keyword_stuffing": 10,
+    "concrete_facts_partial": 10,  # 1 o 2 datos concretos
+    "concrete_facts_full": 20,     # 3 o más (reemplaza al parcial)
+}
+
+
+def quality_percent(result: DeterministicScoreResult) -> int:
+    """
+    Puntaje 0-100 derivado solo de checks deterministas.
+    Un producto que cumple todo y trae 3+ datos concretos llega a 100.
+    """
+    score = 0
+
+    if result.title_length_ok:
+        score += QUALITY_WEIGHTS["title_length_ok"]
+    if result.body_word_count_ok:
+        score += QUALITY_WEIGHTS["body_word_count_ok"]
+    if result.has_structural_elements:
+        score += QUALITY_WEIGHTS["has_structural_elements"]
+    if not result.forbidden_words_found:
+        score += QUALITY_WEIGHTS["no_forbidden_words"]
+    if not result.keyword_stuffing_flag:
+        score += QUALITY_WEIGHTS["no_keyword_stuffing"]
+
+    if result.concrete_facts_count >= 3:
+        score += QUALITY_WEIGHTS["concrete_facts_full"]
+    elif result.concrete_facts_count >= 1:
+        score += QUALITY_WEIGHTS["concrete_facts_partial"]
+
+    return min(score, 100)

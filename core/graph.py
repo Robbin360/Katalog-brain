@@ -1179,11 +1179,19 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
         else:
             old_title, old_body_html = "", ""
 
+        # El inspector necesita una REFERENCIA de identidad para juzgar
+        # relevancia. Caso real: el producto 1004 (snowboard) recibio una
+        # propuesta titulada "Estabilizador de Video Profesional para
+        # Camara y Cine" y el gate anterior no pudo detectarlo porque
+        # nunca supo de que producto se trataba.
         verdict = await evaluate_rewrite(
-            old_title=old_title,
-            old_body_html=old_body_html,
-            new_title=proposal_dict.get("new_title"),
-            new_body_html=proposal_dict.get("new_body_html"),
+            current_title=old_title,
+            current_body_html=old_body_html,
+            candidate_title=proposal_dict.get("new_title"),
+            candidate_body_html=proposal_dict.get("new_body_html"),
+            vendor=(state.get("product") or {}).get("vendor"),
+            tags=(state.get("product") or {}).get("tags"),
+            forbidden_words=state["brand_rules"].forbidden_words if state.get("brand_rules") else None,
         )
         audit_log_data.append(verdict.as_log_line())
         print(f"⚖️ [Gate] {verdict.as_log_line()}")
@@ -1216,7 +1224,7 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
 
         update_payload: dict[str, Any] = {
             "ai_proposal": proposal_dict,
-            "audit_score": verdict.new_score,
+            "audit_score": verdict.audit_score,
             "audit_log": audit_log_data,
             "audit_status": next_status,
             "last_audit_at": utc_now_iso(),
@@ -1247,7 +1255,7 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
             # El costo de tokens lo absorbe el negocio: es un fallo de
             # calidad nuestro, no un servicio prestado al cliente.
             await _refund_reservation(state, "gate_rejected")
-            print(f"  [Nodo 5] Gate rechazó (delta={verdict.delta}). Crédito devuelto, marcado {next_status}.")
+            print(f"  [Nodo 5] Gate rechazó: {verdict.as_log_line()} Crédito devuelto, marcado {next_status}.")
             return {"status": next_status, "retry_attempts": 0}
 
     except Exception as e:
