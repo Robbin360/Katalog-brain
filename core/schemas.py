@@ -18,7 +18,12 @@ class BrandRules(BaseModel):
     formatting_rules: str
 
 class AIProposalOutput(BaseModel):
-    new_title: str = Field(..., max_length=70, description="SEO optimized title. Max 70 characters.")
+    # Piso de 40: el quality gate determinista rechaza titulos mas cortos
+    # (TITLE_MIN_LENGTH en core/deterministic_score.py). Imponerlo aqui deja
+    # que output_retries de pydantic-ai lo corrija en el ciclo de escritura,
+    # que es mucho mas barato que un rechazo del gate.
+    # Techo de 70: rango donde Google trunca por ancho en pixeles.
+    new_title: str = Field(..., min_length=40, max_length=70, description="SEO optimized title. Between 40 and 70 characters.")
     new_body_html: str = Field(..., min_length=80, description="High conversion HTML description using <ul> and <strong> tags.")
     seo_tags: str = Field(..., description="Comma separated SEO keywords.")
     audit_log: List[str] = Field(..., min_length=1, description="Specific reasons for changes.")

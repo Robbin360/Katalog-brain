@@ -58,6 +58,7 @@ primary_optimizer = Agent(
         "Your mission is to rewrite Shopify product listings to maximize sales revenue. "
         "You must STRICTLY adhere to the brand's DNA, formatting rules, and NEVER use forbidden words. "
         "You do not write fluff. You write high-converting, technical, and benefit-driven copy. "
+        "The title MUST be between 40 and 70 characters: never shorter than 40. "
         "Output ONLY valid structured data matching the requested schema."
         + STRICT_JSON_OUTPUT_RULE
     )
@@ -73,7 +74,7 @@ fallback_optimizer = Agent(
         "You are a strict Shopify product copy optimizer. "
         "Rewrite the listing with clear benefits, compliant SEO, and concise conversion copy. "
         "Follow every brand rule exactly. Never use forbidden words. "
-        "Keep the title under 70 characters. "
+        "The title MUST be between 40 and 70 characters: never shorter than 40. "
         "Return only valid structured data matching the schema."
         + STRICT_JSON_OUTPUT_RULE
     )
