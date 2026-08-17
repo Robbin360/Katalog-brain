@@ -1296,7 +1296,13 @@ async def mark_needs_optimization(state: KatalogState) -> dict[str, Any]:
         update_data: dict[str, Any] = {
             "audit_status": next_status,
             "error_log": error_log,
-            "retry_attempts": MAX_CRITIC_ATTEMPTS,
+            # 0, no MAX_CRITIC_ATTEMPTS: el filtro de elegibilidad del Auto-Pilot
+            # exige retry_attempts < 3, asi que escribir 3 aqui saca al producto de
+            # la cola con un solo fallo de calidad y le impide escalar a
+            # NEEDS_REVIEW. La escalada la gobierna consecutive_failures (ver
+            # MAX_GATE_FAILURES); retry_attempts es backoff de errores transitorios
+            # del proveedor, no un bloqueo de calidad. El nodo 5 ya escribe 0.
+            "retry_attempts": 0,
             "next_retry_at": None,
             "consecutive_failures": next_cf,
             "last_failure_at": utc_now_iso(),
