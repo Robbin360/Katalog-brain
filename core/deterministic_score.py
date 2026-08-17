@@ -204,6 +204,22 @@ def count_concrete_facts(text: str) -> int:
     return len(_CONCRETE_FACT_RE.findall(text))
 
 
+def extract_concrete_facts(text: str) -> list[str]:
+    """
+    Devuelve los hechos concretos presentes en el texto, no solo su conteo.
+
+    Existe para que el orquestador pueda entregarle al redactor los datos
+    que el comerciante YA publico. Repetir "158 cm" que estaba en la
+    descripcion original no es inventar: es preservar. La regla anterior
+    prohibia mencionar medidas cuando no habia dossier verificado, asi que
+    el redactor perdia los hechos que ya tenia delante.
+
+    Usa finditer y group(0) a proposito: findall con este patron devuelve
+    el grupo opcional del decimal, no la coincidencia completa.
+    """
+    return [m.group(0).strip() for m in _CONCRETE_FACT_RE.finditer(text or "")]
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 5. ESTRUCTURA HTML (evitar "muro de texto")
 # ─────────────────────────────────────────────────────────────────────

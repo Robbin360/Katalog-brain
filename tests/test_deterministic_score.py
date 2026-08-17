@@ -285,3 +285,25 @@ def test_inflesz_es_informativo_no_eliminatorio():
     assert result.inflesz_band in {"muy_dificil", "algo_dificil"}
     assert not any("INFLESZ" in f for f in result.failures)
     assert result.passes_gate is True
+
+
+def test_extract_concrete_facts_devuelve_los_hechos_no_solo_el_conteo():
+    """
+    El orquestador necesita los hechos, no cuantos hay, para pasarselos al
+    redactor. findall con este patron devolveria el grupo del decimal.
+    """
+    from core.deterministic_score import extract_concrete_facts
+
+    text = "Mide 158 cm de largo y pesa 3.2 kg, soporta hasta 120 kg."
+    facts = extract_concrete_facts(text)
+
+    assert len(facts) == 3
+    assert "158 cm" in facts
+    assert "3.2 kg" in facts
+
+
+def test_extract_concrete_facts_texto_generico_o_vacio():
+    from core.deterministic_score import extract_concrete_facts
+
+    assert extract_concrete_facts("Es una tabla muy buena") == []
+    assert extract_concrete_facts(None) == []

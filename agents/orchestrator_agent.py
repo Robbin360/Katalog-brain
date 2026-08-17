@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass
 from pydantic_ai import Agent, RunContext
 from core.schemas import OrchestratorPlan
+from core.deterministic_score import extract_concrete_facts, strip_html_to_text
 
 logger = logging.getLogger(__name__)
 
@@ -89,15 +90,32 @@ copywriter_instructions: Sé QUIRÚRGICO y ESPECÍFICO sobre QUÉ escribir.
   · Si el dossier TIENE specs verificadas: indica exactamente cuáles usar y
     cómo justifican el precio. Cita los hechos concretos disponibles.
 
-  · Si el dossier está VACÍO ("Sin specs verificadas"): tus instrucciones
-    DEBEN abrir con esta frase literal:
-    "MODO SIN DATOS VERIFICADOS: prohibido mencionar materiales, medidas,
-    composición, certificaciones o cifras de rendimiento."
-    Después indica al Redactor que construya el copy sobre uso previsto,
-    problema que resuelve, experiencia de uso y claridad de la oferta.
-    NO le pidas justificar el precio ni ser específico en lo técnico:
-    no tiene con qué, y si se lo pides INVENTARÁ datos que el Juez
-    rechazará, bloqueando el producto.
+  · Si el dossier está VACÍO ("Sin specs verificadas"):
+
+    La regla es PROHIBIDO INVENTAR, no prohibido ser concreto.
+
+    El Redactor SÍ puede usar:
+      - los hechos listados en "HECHOS YA PUBLICADOS POR EL COMERCIANTE":
+        repetirlos no es inventar, es preservar lo que la tienda ya afirma;
+      - la categoría y los atributos que aparecen en el título y los tags
+        (por ejemplo "All-Mountain", "Freestyle", "Digital"): son la
+        identidad del producto según la tienda;
+      - el uso previsto, el problema que resuelve y la experiencia de uso.
+
+    El Redactor NO puede:
+      - inventar medidas, materiales, certificaciones, garantías ni cifras
+        de rendimiento que no estén en el dossier ni en la lista de hechos
+        ya publicados;
+      - justificar un precio premium sin hechos que lo respalden.
+
+    INSTRUCCIÓN OBLIGATORIA: si hay hechos ya publicados, enuméralos
+    explícitamente en copywriter_instructions y ordena conservarlos. Perder
+    un dato concreto que la ficha ya tenía es una regresión y el Gate la
+    rechaza.
+
+    Si NO hay ningún hecho publicado ni dossier, entonces sí: copy sobrio
+    sobre uso y problema resuelto, sin cifras. Y marca
+    fact_anchored_alert=True para que el comerciante sepa qué datos añadir.
 
 judge_instructions: Qué debe verificar el Juez específicamente.
   Menciona: qué afirmaciones técnicas comprobar contra el dossier,
@@ -114,6 +132,18 @@ def inject_product_context(ctx: RunContext[OrchestratorDeps]) -> str:
 
     specs_text = "VACÍO — no hay specs verificadas" if not d.cached_specs else \
         "\n".join(f"  - {k}: {v}" for k, v in d.cached_specs.items())
+
+    # Hechos que el comerciante YA publico en su propia descripcion.
+    # No son "verificados" como el dossier, pero tampoco son inventados:
+    # son afirmaciones del propio comerciante. Preservarlos no crea riesgo
+    # legal nuevo, y perderlos degrada el copy (caso real: el producto 1009
+    # paso de "Tabla All-Mountain de Alto Rendimiento" a "Tabla Pro Extreme"
+    # en cuatro publicaciones sucesivas).
+    current_html = d.product.get("current_body_html", d.product.get("descriptionHtml", "")) or ""
+    existing_facts = extract_concrete_facts(strip_html_to_text(current_html))
+    existing_facts_text = (
+        ", ".join(existing_facts) if existing_facts else "Ninguno detectado"
+    )
 
     # Métricas reales de la DB: orders_count_7d, orders_count_30d
     orders_7d  = d.metrics.get("orders_count_7d",  d.metrics.get("sales_7d",  0))
@@ -149,6 +179,9 @@ ANÁLISIS DE PRECIO:
 
 SPECS VERIFICADAS (Dossier):
 {specs_text}
+
+HECHOS YA PUBLICADOS POR EL COMERCIANTE (en su descripcion actual):
+{existing_facts_text}
 
 SKILLS DISPONIBLES EN LA BIBLIOTECA:
 {', '.join(d.available_skills) if d.available_skills else 'Ninguna disponible'}
