@@ -21,7 +21,6 @@ Dependencias:
 # ─── IMPORTS ─────────────────────────────────────────────────────────────────
  
 import asyncio
-import hashlib
 import logging
 import os
 import re
@@ -33,6 +32,7 @@ import httpx
 from pydantic import BaseModel
 from pydantic_ai import Agent
 from supabase import create_client, Client
+from core.helpers import build_product_fingerprint as build_fingerprint
 from core.model_config import RESEARCHER_MODEL
  
 logger = logging.getLogger(__name__)
@@ -179,30 +179,7 @@ REGLAS ESTRICTAS:
  
  
 # ─── CACHÉ SHA-256 ────────────────────────────────────────────────────────────
- 
-VARIANT_PATTERNS = [
-    r'\b(negro|blanco|rojo|azul|verde|gris|beige|dorado|plateado|rosa|morado)\b',
-    r'\b(black|white|red|blue|green|gray|grey|gold|silver|pink|purple|orange)\b',
-    r'\b(xs|sm|md|lg|xl|xxl|xxxl|talla|size)\b',
-    r'\b(3[6-9]|4[0-9]|5[0-2])\b',
-    r'\b(nuevo|new|edicion|edition|especial|special|pack|kit|set|bundle)\b',
-]
- 
- 
-def build_fingerprint(vendor: str, product_type: str, title: str) -> str:
-    """
-    SHA-256 del modelo base eliminando variantes (color, talla).
-    Garantiza que el caché funcione para todas las variantes del mismo modelo.
-    """
-    base = title.lower().strip()
-    for pattern in VARIANT_PATTERNS:
-        base = re.sub(pattern, '', base, flags=re.IGNORECASE)
-    base = ' '.join(base.split())
- 
-    raw = f"{vendor.lower().strip()}_{product_type.lower().strip()}_{base}"
-    return hashlib.sha256(raw.encode()).hexdigest()
- 
- 
+
 async def check_enrichment_cache(fingerprint: str) -> Optional[dict]:
     """Busca en product_enrichment. Retorna datos si existe, None si no."""
     try:
@@ -650,6 +627,7 @@ async def research_product(
     gaps_detected:         Optional[list[str]] = None,
     critical_gaps:         Optional[list[str]] = None,
     max_rounds:            int        = 3,
+    fingerprint:           Optional[str] = None,
 ) -> ResearchResult:
     """
     Agente Investigador completo.
@@ -673,11 +651,17 @@ async def research_product(
     )
  
     # ── CACHÉ ────────────────────────────────────────────────────────────────
-    fingerprint = build_fingerprint(
-        product.get("vendor", ""),
-        product.get("productType", ""),
-        product.get("title", ""),
-    )
+    if not fingerprint:
+        # Fallback defensivo. Usa current_title porque las filas de
+        # shopify_products no tienen "title" ni "productType": usarlas daba
+        # un hash identico para todo producto del mismo vendor y contaminaba
+        # el cache entre productos (verificado 2026-08-17: cera de tablas con
+        # specs de turbina de gas).
+        fingerprint = build_fingerprint(
+            product.get("vendor", "") or "",
+            product.get("productType", product.get("product_type", "")) or "",
+            product.get("current_title", product.get("title", "")) or "",
+        )
  
     cached = await check_enrichment_cache(fingerprint)
     if cached:
@@ -820,6 +804,7 @@ async def researcher_node(state: dict) -> dict:
             research_instructions = getattr(plan, "research_instructions", "") or "",
             gaps_detected         = state.get("data_gaps") or None,
             critical_gaps         = state.get("data_gaps") or None,
+            fingerprint           = state.get("fingerprint"),
         )
         return {**state, "research_result": result}
  
