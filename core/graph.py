@@ -24,6 +24,7 @@ from core.helpers import (
     utc_now_iso,
 )
 from core.quality_gate import evaluate_rewrite
+from core.deterministic_score import strip_html_to_text
 from core.schemas import BrandRules, ProductContext, OrchestratorPlan
 from core.shopify_tools import publish_to_shopify as publish_product_to_shopify
 from core.shopify_api import get_product_taxonomy
@@ -84,21 +85,95 @@ AUDIENCE_PROMPT_MAP = {
 }
 
 # Se inyecta al escritor cuando el Investigador no produjo dossier.
-# Sin esto, el escritor copia specs de la descripción original y el Juez
-# las rechaza en las 3 iteraciones: bucle garantizado, cero avance.
-NO_DOSSIER_NOTICE = """
+# ⚠️ Los hechos que el comerciante YA publicó no son invención: son
+# afirmaciones suyas, visibles hoy en su tienda. Prohibirlos aquí mientras el
+# Orquestador ordena conservarlos crea dos mandatos incompatibles en el MISMO
+# prompt y garantiza el bucle de 3 iteraciones. Caso real: producto 1010
+# (2026-08-17), rechazado 3 veces por "Durabond Bio-Epoxy", dato que ya
+# estaba publicado en la ficha original.
+NO_DOSSIER_TEMPLATE = """
 DOSSIER VERIFICADO: Sin specs verificadas.
 
-REGLA ABSOLUTA — el Juez rechazará la propuesta si la incumples:
-NO incluyas ninguna especificación técnica concreta. Esto abarca materiales,
-aleaciones, composición, dimensiones, medidas, pesos, capacidades,
-certificaciones, normas técnicas y cifras de rendimiento.
+DESCRIPCION QUE EL COMERCIANTE YA TIENE PUBLICADA (fuente valida):
+{merchant_source}
 
-Esta prohibición aplica AUNQUE esos datos aparezcan en la descripción
-original del producto: no han sido verificados y no puedes tratarlos como
-hechos. Escribe con lenguaje cualitativo (uso previsto, beneficio, acabado,
-durabilidad percibida) sin afirmar ningún dato concreto.
+REGLA ABSOLUTA — el Juez rechazará la propuesta si la incumples:
+NO INVENTES ninguna especificación técnica que no aparezca en el texto de
+arriba.
+Esto abarca materiales, aleaciones, composición, dimensiones, medidas, pesos,
+capacidades, certificaciones, normas técnicas y cifras de rendimiento.
+
+Repetir un dato que ya aparece en el texto de arriba NO es inventar: es
+preservar lo que la tienda ya afirma, y perderlo cuenta como regresión. Para
+todo lo demás usa lenguaje cualitativo (uso previsto, beneficio, acabado,
+durabilidad percibida) sin afirmar ningún dato concreto nuevo.
 """
+
+
+def _merchant_source_text(state: KatalogState) -> str:
+    """Descripcion publicada por el comerciante, en texto plano.
+
+    Fuente de verdad literal para el Juez. No usamos extract_concrete_facts
+    aqui: su regex solo captura numero+unidad, asi que perdia materiales y
+    acabados. Caso real: producto 1010 (2026-08-17), rechazado 3 veces por
+    "Durabond Bio-Epoxy", dato ya publicado que el extractor no veia.
+    """
+    context = state.get("product_context")
+    if isinstance(context, ProductContext):
+        html = context.current_body_html or ""
+    elif isinstance(context, dict):
+        html = context.get("current_body_html") or ""
+    else:
+        html = (state.get("product") or {}).get("current_body_html") or ""
+    try:
+        text = strip_html_to_text(html)
+    except Exception as e:
+        print(f"⚠️ [Hechos] No se pudo extraer la descripcion publicada: {e}")
+        return ""
+    # Techo de seguridad: el Juez ya recibe la propuesta completa y no
+    # queremos duplicar fichas enormes dentro del prompt.
+    return text[:2500]
+
+
+def _merchant_source_block(text: str) -> str:
+    return text if text.strip() else "(La ficha actual no tiene descripcion)"
+
+
+def _judge_verified_sources_block(state: KatalogState) -> str:
+    """Fuentes verificadas para el Juez.
+
+    Prioridad:
+    1) dossier producido por el Investigador en ESTA corrida
+    2) cache preexistente (legacy fallback)
+
+    El bug real del 1010 fue que el escritor recibió research_result pero el
+    Juez miró cached_specs, que se calcula antes del investigador y puede
+    estar vacío o stale.
+    """
+    research_result = state.get("research_result")
+    dossier_text = format_dossier_for_prompt(research_result)
+    if dossier_text and dossier_text.strip():
+        return dossier_text
+
+    cached_specs = state.get("cached_specs")
+    if cached_specs:
+        try:
+            lines = ["## ESPECIFICACIONES TÉCNICAS (CACHE PREEXISTENTE)\n"]
+            for key, value in cached_specs.items():
+                if isinstance(value, dict):
+                    val = value.get("value", "")
+                    conf = value.get("confidence", "")
+                    if conf:
+                        lines.append(f"- {key}: {val} [confidence: {conf}]")
+                    else:
+                        lines.append(f"- {key}: {val}")
+                else:
+                    lines.append(f"- {key}: {value}")
+            return "\n".join(lines)
+        except Exception as e:
+            print(f"⚠️ [Juez] No se pudo formatear cached_specs: {e}")
+
+    return "Sin specs verificadas"
 
 
 async def _run_sync(callable_obj):
@@ -748,7 +823,11 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
         # Formatear dossier del Investigador (si existe)
         dossier_text = format_dossier_for_prompt(research_result) if research_result else ""
         if not dossier_text.strip():
-            dossier_text = NO_DOSSIER_NOTICE
+            source = _merchant_source_text(state)
+            print(f"📌 [Nodo 3] Ficha publicada como fuente valida: {len(source)} chars")
+            dossier_text = NO_DOSSIER_TEMPLATE.format(
+                merchant_source=_merchant_source_block(source)
+            )
 
         orchestrator_section = f"""
     ════════════════════════════════════════════════════════
@@ -1099,7 +1178,14 @@ async def review_proposal(state: KatalogState) -> dict[str, Any]:
     Provide actionable feedback for the writer to fix it.
     """
 
+    print(
+        "📚 [Nodo 4] Fuentes del Juez:",
+        "research_result" if format_dossier_for_prompt(state.get("research_result")).strip() else
+        ("cached_specs" if state.get("cached_specs") else "none"),
+    )
+
     # Inyectar instrucciones del Juez desde el Plan del Orquestador
+    verified_sources = _judge_verified_sources_block(state)
     plan = state.get("orchestrator_plan")
     if plan and plan.judge_instructions:
         prompt += f"""
@@ -1107,9 +1193,18 @@ async def review_proposal(state: KatalogState) -> dict[str, Any]:
     INSTRUCCIONES ESPECÍFICAS DEL DIRECTOR (VERIFICAR OBLIGATORIAMENTE):
     {plan.judge_instructions}
 
-    DOSSIER VERIFICADO (fuente única de hechos — cualquier afirmación técnica
-    que no esté en este dossier DEBE ser rechazada):
-    {state.get('cached_specs') or 'Sin specs verificadas'}
+    FUENTES VÁLIDAS DE HECHOS. Cualquier afirmación técnica que no provenga
+    de una de estas dos listas DEBE ser rechazada:
+
+    1) DOSSIER VERIFICADO:
+    {verified_sources}
+
+    2) DESCRIPCION QUE EL COMERCIANTE YA TIENE PUBLICADA. Toda afirmacion
+       tecnica que aparezca en este texto es VALIDA: es del propio
+       comerciante y ya esta visible en su tienda. NO la rechaces por
+       "no verificada". Solo rechaza afirmaciones que no esten ni en el
+       dossier ni en este texto.
+    {_merchant_source_block(_merchant_source_text(state))}
     """
 
     try:
