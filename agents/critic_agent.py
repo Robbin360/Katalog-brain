@@ -5,9 +5,9 @@ from google.genai import errors as genai_errors
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 from core.model_config import CRITIC_FALLBACK_MODEL, CRITIC_PRIMARY_MODEL
+from core.provider_errors import is_retryable_provider_error
 from core.schemas import CriticFeedback
 
-RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 MAX_RETRIES = 3
 STRICT_JSON_OUTPUT_RULE = (
     " STRICT RULE: Your output MUST be a pure JSON object matching the schema. "
@@ -16,35 +16,7 @@ STRICT_JSON_OUTPUT_RULE = (
     "Ensure ALL metadata fields are present."
 )
 
-
-def _status_code(error: BaseException) -> int | None:
-    raw_status = getattr(error, "status_code", None) or getattr(error, "code", None)
-    try:
-        return int(raw_status) if raw_status is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _is_retryable_provider_error(error: BaseException) -> bool:
-    if isinstance(error, (TimeoutError, httpx.TimeoutException, httpx.TransportError)):
-        return True
-
-    if isinstance(error, ModelHTTPError):
-        status_code = _status_code(error)
-        return status_code in RETRYABLE_STATUS_CODES
-
-    if isinstance(error, ModelAPIError):
-        status_code = _status_code(error)
-        return status_code in RETRYABLE_STATUS_CODES
-
-    if isinstance(error, genai_errors.ServerError):
-        return True
-
-    if isinstance(error, (genai_errors.APIError, genai_errors.ClientError)):
-        status_code = _status_code(error)
-        return status_code in RETRYABLE_STATUS_CODES
-
-    return False
+_is_retryable_provider_error = is_retryable_provider_error  # alias local
 
 
 primary_critic = Agent(

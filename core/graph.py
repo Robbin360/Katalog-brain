@@ -12,7 +12,10 @@ from supabase import Client, create_client
 
 from agents.critic_agent import run_critic_with_fallback
 from agents.optimizer_agent import run_optimizer_with_fallback
-from agents.orchestrator_agent import orchestrator_agent, OrchestratorDeps
+from agents.orchestrator_agent import (
+    run_orchestrator_with_fallback,
+    OrchestratorDeps,
+)
 from agents.researcher_agent import researcher_node, check_enrichment_cache, format_dossier_for_prompt
 from core.helpers import (
     classify_product_type,
@@ -180,6 +183,27 @@ async def _run_sync(callable_obj):
     return await asyncio.to_thread(callable_obj)
 
 
+async def _heartbeat(product_id: Any) -> None:
+    """Señal de vida de la corrida actual.
+
+    El Zombie Sweeper (core/worker.py) usa esto para distinguir "trabajando"
+    de "muerto". Sin latido medía updated_at, que solo se escribe en el Nodo 0,
+    y con corridas de 20+ minutos declaraba zombie trabajo vivo.
+
+    Nunca propaga excepciones: un fallo al latir no debe abortar una corrida
+    que por lo demás va bien. El peor caso es que el sweeper la rescate tarde.
+    """
+    try:
+        await _run_sync(
+            lambda: supabase.table("shopify_products")
+            .update({"processing_heartbeat_at": utc_now_iso()})
+            .eq("id", product_id)
+            .execute()
+        )
+    except Exception as e:
+        print(f"⚠️ [Heartbeat] No se pudo latir para {product_id}: {e}")
+
+
 def _to_int(value: Any) -> int:
     try:
         return int(value or 0)
@@ -332,6 +356,7 @@ def _error_retry_update(state: KatalogState, error_message: str) -> dict[str, An
         "error_log": error_message,
         "retry_attempts": new_retry,
         "next_retry_at": next_retry_at,
+        "processing_heartbeat_at": None,
     }
 
 
@@ -496,6 +521,7 @@ async def start_processing(state: KatalogState) -> dict[str, Any]:
         await _run_sync(lambda: supabase.table("shopify_products").update({
             "audit_status": STATUS_PROCESSING,
             "error_log": None,
+            "processing_heartbeat_at": utc_now_iso(),
             "updated_at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         }, returning="representation").eq("id", product_id).execute())
 
@@ -732,6 +758,8 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     if state.get("error"):
         return {}
 
+    await _heartbeat(state["product_id"])
+
     context = state["product_context"]
     rules = state["brand_rules"]
     memory = state.get("letta_memory", "")
@@ -874,6 +902,8 @@ async def fetch_db_data_orchestrator(state: KatalogState) -> dict[str, Any]:
     if state.get("error"):
         return {}
 
+    await _heartbeat(state["product_id"])
+
     # product_id es BIGINT en la DB — siempre pasamos int
     product_id = int(state["product_id"])
     user_id    = str(state.get("user_id", ""))
@@ -1001,7 +1031,7 @@ async def do_not_harm_check(state: KatalogState) -> dict[str, Any]:
         )
 
     if is_consistent and is_poor_copy and not is_viral_spike:
-        await _update_status({"audit_status": QUADRANT_STABLE})
+        await _update_status({"audit_status": QUADRANT_STABLE, "processing_heartbeat_at": None})
         await _refund_reservation(state, "do_not_harm:STABLE_PERFORMING")
         print(f"🚫 [Do-Not-Harm] {product_id} → STABLE_PERFORMING (avg_weekly={avg_weekly:.1f})")
         return {"product_quadrant": QUADRANT_STABLE}
@@ -1025,19 +1055,19 @@ async def do_not_harm_check(state: KatalogState) -> dict[str, Any]:
                 return {"product_quadrant": QUADRANT_MONITORING}
         else:
             now_iso = datetime.now(timezone.utc).isoformat()
-            await _update_status({"audit_status": QUADRANT_MONITORING, "monitoring_since": now_iso})
+            await _update_status({"audit_status": QUADRANT_MONITORING, "monitoring_since": now_iso, "processing_heartbeat_at": None})
             await _refund_reservation(state, "do_not_harm:MONITORING_START")
             print(f"📊 [Do-Not-Harm] {product_id} → MONITORING (inicio)")
             return {"product_quadrant": QUADRANT_MONITORING}
 
     if is_consistent and is_good_copy:
-        await _update_status({"audit_status": QUADRANT_BENCHMARK})
+        await _update_status({"audit_status": QUADRANT_BENCHMARK, "processing_heartbeat_at": None})
         await _refund_reservation(state, "do_not_harm:BENCHMARK")
         print(f"🏆 [Do-Not-Harm] {product_id} → BENCHMARK")
         return {"product_quadrant": QUADRANT_BENCHMARK}
 
     if is_dead and is_good_copy:
-        await _update_status({"audit_status": QUADRANT_INVESTIGATE})
+        await _update_status({"audit_status": QUADRANT_INVESTIGATE, "processing_heartbeat_at": None})
         await _refund_reservation(state, "do_not_harm:INVESTIGATE_CAUSE")
         print(f"🔍 [Do-Not-Harm] {product_id} → INVESTIGATE_CAUSE")
         return {"product_quadrant": QUADRANT_INVESTIGATE}
@@ -1062,6 +1092,8 @@ async def orchestrator_node(state: KatalogState) -> dict[str, Any]:
     if state.get("error"):
         return {}
 
+    await _heartbeat(state["product_id"])
+
     product_id = int(state["product_id"])
     user_id    = str(state.get("user_id", ""))
 
@@ -1077,15 +1109,13 @@ async def orchestrator_node(state: KatalogState) -> dict[str, Any]:
     )
 
     try:
-        result = await orchestrator_agent.run(
-            "Diagnostica este producto y genera el Plan de Vuelo.",
-            deps=deps,
-        )
+        result = await run_orchestrator_with_fallback(deps)
         plan = result.output   # NO result.data — API correcta de PydanticAI v2
         print(f"\U0001f4cb [Orquestador] Plan generado: {plan.primary_problem} / {plan.product_quadrant}")
 
     except Exception as e:
-        print(f"\u274c [Orquestador] Falló para producto {product_id}: {e}")
+        print(f"❌ [Orquestador] Ambos modelos fallaron para producto {product_id}: {e}")
+        print("⚠️ [Orquestador] Usando PLAN CONSERVADOR degradado. El diagnóstico NO es real.")
         # Plan conservador — el sistema nunca se detiene
         plan = OrchestratorPlan(
             diagnosis                 = "Orquestador no disponible — plan conservador",
@@ -1110,12 +1140,17 @@ async def orchestrator_node(state: KatalogState) -> dict[str, Any]:
 
     # Guardar diagnóstico en Supabase para auditoría
     # shopify_products.id es BIGINT → int(product_id)
+    # Solo el diagnostico. NO se escribe audit_status aqui: el producto esta en
+    # PROCESSING y debe seguir asi hasta que el grafo termine. Escribir el
+    # cuadrante del plan lo devolvia a la cola a los pocos segundos de arrancar,
+    # con tres efectos: el Auto-Pilot podia reclamarlo a mitad de corrida, el
+    # Zombie Sweeper dejaba de verlo (y su reserva de credito quedaba congelada
+    # si el proceso moria), y la UI mostraba "Necesita optimizacion" durante
+    # toda la ejecucion. Los cuadrantes terminales los escribe
+    # do_not_harm_check, que es la autoridad determinista.
     await _run_sync(
         lambda: supabase.table("shopify_products")
-        .update({
-            "orchestrator_diagnosis": plan.model_dump(),
-            "audit_status":           plan.product_quadrant,
-        })
+        .update({"orchestrator_diagnosis": plan.model_dump()})
         .eq("id", product_id)
         .execute()
     )
@@ -1158,6 +1193,8 @@ async def review_proposal(state: KatalogState) -> dict[str, Any]:
         return {"iterations": iteration}
     if not proposal:
         return {"error": "No hay propuesta para evaluar.", "iterations": iteration}
+
+    await _heartbeat(state["product_id"])
 
     rules = state["brand_rules"]
     raw_tone = (rules.tone_voice or "professional").lower().strip()
@@ -1258,6 +1295,8 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
     if not proposal:
         return {"error": "No hay propuesta aprobada para guardar."}
 
+    await _heartbeat(state["product_id"])
+
     try:
         proposal_dict = _proposal_to_dict(proposal)
         proposal_dict.pop("audit_score", None)  # el escritor ya no se autocalifica
@@ -1327,6 +1366,7 @@ async def save_to_supabase(state: KatalogState) -> dict[str, Any]:
             "retry_attempts": 0,
             "next_retry_at": None,
             "consecutive_failures": next_cf,
+            "processing_heartbeat_at": None,
         }
 
         if not verdict.passed:
@@ -1401,6 +1441,7 @@ async def mark_needs_optimization(state: KatalogState) -> dict[str, Any]:
             "next_retry_at": None,
             "consecutive_failures": next_cf,
             "last_failure_at": utc_now_iso(),
+            "processing_heartbeat_at": None,
         }
 
         if proposal:
@@ -1494,6 +1535,7 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
             "error_log": None,
             "retry_attempts": 0,
             "next_retry_at": None,
+            "processing_heartbeat_at": None,
         }, returning="representation").eq("id", product_id).execute())
 
         await _run_sync(lambda: supabase.table("optimizations").insert({

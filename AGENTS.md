@@ -34,12 +34,18 @@ python scripts/visualize_graph.py
 ## Agents and fallback chains
 | Agent | Primary | Fallback |
 |---|---|---|
-| Optimizer | `gemini-2.5-pro` | `groq:llama-3.3-70b-versatile` |
-| Critic | `gemini-2.5-flash` | `groq:openai/gpt-oss-120b` |
-| Reclassifier (scripts) | `deepseek/deepseek-v4-flash:free` (OpenRouter) | `groq:qwen/qwen3-32b` |
-| Inspector | `gemini-2.5-flash-lite` | none |
+| Optimizer | `google-gla:gemini-3.5-flash` | `groq:openai/gpt-oss-120b` |
+| Critic | `google-gla:gemini-2.5-flash` | `groq:openai/gpt-oss-120b` |
+| Reclassifier (scripts) | `deepseek/deepseek-v4-flash:free` (OpenRouter) | `groq:openai/gpt-oss-120b` |
+| Inspector | `google-gla:gemini-3.1-flash-lite` | none |
 | Orchestrator | `google:gemini-3.5-flash` | hardcoded conservative plan |
 | Researcher | `google:gemini-3.5-flash` | Tavily+Firecrawl for web search |
+
+Nota: `groq:llama-3.3-70b-versatile` (fallback del Optimizer) fue retirado por
+Groq el 2026-08-16 y `groq:qwen/qwen3-32b` (fallback del Reclassifier) el
+2026-07-17; ambos reemplazados por `groq:openai/gpt-oss-120b`
+(console.groq.com/docs/deprecations). Los valores de la tabla reflejan
+`core/model_config.py`.
 
 ## Gotchas
 - **No tests exist** — manual verification only.

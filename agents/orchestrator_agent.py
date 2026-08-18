@@ -14,9 +14,12 @@ TIPOS DE DATOS SUPABASE (verificados via MCP):
 
 import logging
 from dataclasses import dataclass
+from typing import Any
 from pydantic_ai import Agent, RunContext
 from core.schemas import OrchestratorPlan
 from core.deterministic_score import extract_concrete_facts, strip_html_to_text
+from core.model_config import ORCHESTRATOR_FALLBACK_MODEL, ORCHESTRATOR_PRIMARY_MODEL
+from core.provider_errors import is_retryable_provider_error
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +37,7 @@ class OrchestratorDeps:
     seo_score_raw: int               # 0-100
 
 
-orchestrator_agent = Agent(
-    model="google:gemini-3.5-flash",   # prefijo correcto — NO google-gla:
-    output_type=OrchestratorPlan,       # NO result_type
-    deps_type=OrchestratorDeps,
-    retries=3,                          # reintentos automáticos si JSON inválido
-    system_prompt="""
+ORCHESTRATOR_SYSTEM_PROMPT = """
 Eres el Director de Marketing B2B de Katalog AI.
 Tu única función es DIAGNOSTICAR el problema de un producto de Shopify
 y DISEÑAR un Plan de Vuelo (JSON) para el equipo de subagentes.
@@ -121,11 +119,33 @@ judge_instructions: Qué debe verificar el Juez específicamente.
   Menciona: qué afirmaciones técnicas comprobar contra el dossier,
   si el precio fue justificado con hechos reales, qué frases prohibidas
   detectar (garantías inventadas, materiales no verificados).
-""",
+"""
+
+
+primary_orchestrator = Agent(
+    model=ORCHESTRATOR_PRIMARY_MODEL,
+    output_type=OrchestratorPlan,       # NO result_type
+    deps_type=OrchestratorDeps,
+    retries=3,                          # reintentos automáticos si JSON inválido
+    defer_model_check=True,
+    system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
 )
 
+fallback_orchestrator = Agent(
+    model=ORCHESTRATOR_FALLBACK_MODEL,
+    output_type=OrchestratorPlan,
+    deps_type=OrchestratorDeps,
+    retries=3,
+    defer_model_check=True,
+    system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
+)
 
-@orchestrator_agent.system_prompt
+# Backward-compatible alias para imports antiguos.
+orchestrator_agent = primary_orchestrator
+
+
+@primary_orchestrator.system_prompt
+@fallback_orchestrator.system_prompt
 def inject_product_context(ctx: RunContext[OrchestratorDeps]) -> str:
     """Inyecta el contexto completo del producto en el system prompt."""
     d = ctx.deps
@@ -188,3 +208,23 @@ SKILLS DISPONIBLES EN LA BIBLIOTECA:
 
 ═══════════════════════════════════════════════════════
 """
+
+
+async def run_orchestrator_with_fallback(deps: OrchestratorDeps) -> Any:
+    """Plan de vuelo con respaldo ante fallos transitorios del proveedor.
+
+    Sin esto, un 503 de Gemini degradaba la corrida al plan conservador
+    hardcodeado de core/graph.py sin señal clara. Ocurrió en 3 de 4 corridas
+    el 2026-08-17.
+    """
+    prompt = "Diagnostica este producto y genera el Plan de Vuelo."
+    try:
+        return await primary_orchestrator.run(prompt, deps=deps)
+    except Exception as e:
+        if not is_retryable_provider_error(e):
+            raise
+        print(
+            f"⚠️ [Fallback] Orquestador primario falló "
+            f"({type(e).__name__}: {e}). Activando modelo de respaldo..."
+        )
+        return await fallback_orchestrator.run(prompt, deps=deps)

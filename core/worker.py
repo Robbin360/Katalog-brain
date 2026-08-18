@@ -34,6 +34,10 @@ TIER_BATCH_PARALLELISM = {
 
 STATUS_PROCESSING: str = "PROCESSING"
 
+# 45 min, no 15: una corrida real del 1010 tardó 21.8 minutos. Con latido por
+# nodo (core/graph.py:_heartbeat), 45 minutos sin latir sí significa muerto.
+ZOMBIE_TIMEOUT_MINUTES: int = 45
+
 
 def _to_int(value: Any) -> int:
     try:
@@ -212,14 +216,17 @@ async def auto_pilot_patrol() -> None:
         # ==========================================
         try:
             current_time = datetime.now(timezone.utc)
-            zombie_timeout = (current_time - timedelta(minutes=15)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            zombie_timeout = (current_time - timedelta(minutes=ZOMBIE_TIMEOUT_MINUTES)).strftime('%Y-%m-%dT%H:%M:%SZ')
             
-            # Buscar productos atascados en PROCESSING
+            # Buscar productos atascados en PROCESSING. Dos casos: latido vencido,
+            # o latido NULL (filas previas a este cambio o proceso muerto antes del
+            # primer latido) con updated_at vencido — un .lt() sobre NULL nunca
+            # coincide en Postgres y esas filas quedarían huérfanas para siempre.
             zombie_res = await _run_sync(
                 lambda zt=zombie_timeout: supabase.table("shopify_products")
-                .select("id,retry_attempts,user_id,billing_state,reservation_id")
+                .select("id,retry_attempts,user_id,billing_state,reservation_id,processing_heartbeat_at")
                 .eq("audit_status", STATUS_PROCESSING)
-                .lt("updated_at", zt)
+                .or_(f"processing_heartbeat_at.lt.{zt},and(processing_heartbeat_at.is.null,updated_at.lt.{zt})")
                 .execute()
             )
             zombies: list[dict[str, Any]] = zombie_res.data or []
@@ -237,8 +244,9 @@ async def auto_pilot_patrol() -> None:
                         lambda zid=zombie_id, nr=new_retry: supabase.table("shopify_products")
                         .update({
                             "audit_status": "ERROR",
-                            "error_log": "Zombie recovered: PROCESSING timeout (>15 min)",
+                            "error_log": f"Zombie recovered: PROCESSING timeout ({ZOMBIE_TIMEOUT_MINUTES} min)",
                             "retry_attempts": nr,
+                            "processing_heartbeat_at": None,
                             "updated_at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                         }, returning="representation")
                         .eq("id", zid)
