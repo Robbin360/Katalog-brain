@@ -296,8 +296,19 @@ async def fetch_all_products(shop_url: str, access_token: str, job_id: str, last
                     node {
                       id
                       sku
+                      barcode
                       price
                       inventoryQuantity
+                    }
+                  }
+                }
+                metafields(first: 30) {
+                  edges {
+                    node {
+                      namespace
+                      key
+                      value
+                      type
                     }
                   }
                 }
@@ -366,6 +377,12 @@ async def save_products_to_db(products: list, user_id: str):
             "image_url": product.get("featuredImage", {}).get("url", "") if product.get("featuredImage") else "",
             "price": price_val,
             "inventory_quantity": first_variant.get("inventoryQuantity", 0) if first_variant else 0,
+            "product_type":    product.get("productType") or None,
+            "sku":             first_variant.get("sku") or None,
+            "barcode":         first_variant.get("barcode") or None,
+            "seo_title":       (product.get("seo") or {}).get("title") or None,
+            "seo_description": (product.get("seo") or {}).get("description") or None,
+            "metafields":      _flatten_metafields(product),
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         records.append(record)
@@ -382,6 +399,26 @@ async def save_products_to_db(products: list, user_id: str):
             ).execute()
         
         await asyncio.to_thread(_upsert)
+
+
+def _flatten_metafields(product: dict) -> dict:
+    """Metafields de Shopify a dict plano {"namespace.key": {value, type}}.
+
+    Guarda SIN interpretar, a proposito. Cada tienda inventa sus namespaces y
+    formatos (verificado: test_data.snowboard_length trae
+    {"value":159.0,"unit":"CENTIMETERS"} mientras test_data.binding_mount trae
+    el string "Optimistic"). La traduccion a hechos legibles vive en
+    core/helpers.extract_verified_facts, que cambia por razones distintas a
+    este sync.
+    """
+    out: dict = {}
+    for edge in (product.get("metafields") or {}).get("edges", []):
+        node = edge.get("node") or {}
+        ns, key = node.get("namespace"), node.get("key")
+        if not ns or not key:
+            continue
+        out[f"{ns}.{key}"] = {"value": node.get("value"), "type": node.get("type")}
+    return out
 
 
 async def sync_shopify_products(user_id: str, shop_url: str, access_token: str):

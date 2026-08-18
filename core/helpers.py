@@ -73,8 +73,12 @@ def classify_product_type(product: dict) -> str:
     """
     barcode      = (product.get("barcode")      or "").strip()
     sku          = (product.get("sku")          or "").strip()
-    product_type = (product.get("productType")  or "").lower()
-    tags         = [t.lower() for t in (product.get("tags") or [])]
+    product_type = (product.get("product_type") or product.get("productType") or "").lower()
+
+    raw_tags = product.get("tags") or []
+    if isinstance(raw_tags, str):
+        raw_tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+    tags = [t.lower() for t in raw_tags]
 
     # Señales de producto manufacturado (más fuerte: barcode)
     if barcode:
@@ -148,3 +152,64 @@ def build_product_fingerprint(vendor: str, product_type: str, title: str) -> str
 
     raw = f"{vendor.lower().strip()}_{product_type.lower().strip()}_{base}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+# Tipos de metafield que producen hechos afirmables. Lista blanca por TIPO, no
+# por clave: los tipos estructurados de Shopify traen valor Y unidad, asi que
+# son verificables. Los de texto libre no: en la tienda real,
+# test_data.binding_mount = "Optimistic" es basura de datos generados, y
+# pasarsela al escritor produce sinsentidos (verificado 2026-08-18, 3 productos).
+VERIFIED_METAFIELD_TYPES = {
+    "dimension", "weight", "volume", "rating",
+    "number_integer", "number_decimal",
+}
+
+_UNIT_LABELS = {
+    "CENTIMETERS": "cm", "MILLIMETERS": "mm", "METERS": "m",
+    "INCHES": "in", "FEET": "ft",
+    "KILOGRAMS": "kg", "GRAMS": "g", "POUNDS": "lb", "OUNCES": "oz",
+    "LITERS": "L", "MILLILITERS": "ml",
+}
+
+
+def extract_verified_facts(metafields: dict | None) -> list[str]:
+    """Hechos NIVEL 1: emitidos por Shopify, verificados por definicion.
+
+    Son los unicos datos tecnicos que el Juez debe aceptar sin discusion. El
+    bucle de invencion del producto 1010 (2026-08-17) ocurrio teniendo este
+    metafield disponible y descartado: el Juez veto "nucleo de madera" por no
+    verificable, pero habria aceptado "Longitud: 159 cm" sin objecion.
+
+    Determinista, sin LLM y sin red.
+    """
+    if not metafields:
+        return []
+
+    facts: list[str] = []
+    for full_key, entry in metafields.items():
+        if not isinstance(entry, dict):
+            continue
+        mtype = (entry.get("type") or "").strip()
+        if mtype not in VERIFIED_METAFIELD_TYPES:
+            continue
+
+        raw = entry.get("value")
+        label = full_key.split(".")[-1].replace("_", " ").strip().capitalize()
+
+        parsed = raw
+        if isinstance(raw, str) and raw.strip().startswith("{"):
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                parsed = raw
+
+        if isinstance(parsed, dict) and "value" in parsed:
+            value = parsed.get("value")
+            unit = _UNIT_LABELS.get(str(parsed.get("unit") or "").upper(), "")
+            if isinstance(value, float) and value.is_integer():
+                value = int(value)
+            facts.append(f"{label}: {value} {unit}".strip())
+        elif parsed not in (None, ""):
+            facts.append(f"{label}: {parsed}")
+
+    return facts
