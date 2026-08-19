@@ -25,8 +25,57 @@ class AIProposalOutput(BaseModel):
     # Techo de 70: rango donde Google trunca por ancho en pixeles.
     new_title: str = Field(..., min_length=40, max_length=70, description="SEO optimized title. Between 40 and 70 characters.")
     new_body_html: str = Field(..., min_length=80, description="High conversion HTML description using <ul> and <strong> tags.")
-    seo_tags: str = Field(..., description="Comma separated SEO keywords.")
+    # Titulo SEO: es el <title> del HTML y el enlace azul en Google, distinto
+    # del titulo del producto (que es el H1 que ve el comprador). Mismo rango
+    # que new_title porque el limite real de Google es por ancho en pixeles,
+    # no por conteo de caracteres (Google Search Central, "Influencing your
+    # title links"). Debe cargar la keyword principal al inicio.
+    seo_title: str = Field(
+        ...,
+        min_length=40,
+        max_length=70,
+        description=(
+            "SEO title for the <title> tag and Google's search result link. "
+            "Between 40 and 70 characters. Front-load the primary keyword. "
+            "May differ from new_title: this one targets search intent, "
+            "new_title targets the buyer on the page."
+        ),
+    )
+    # Meta descripcion: el parrafo gris bajo el titulo en Google. Sin este
+    # campo, Google recorta un fragmento arbitrario del HTML del cuerpo, a
+    # veces a media palabra. Google trunca por ancho en pixeles alrededor de
+    # 155-160 caracteres; el piso de 110 es regla de producto nuestra para
+    # evitar descripciones que desperdicien el espacio disponible.
+    seo_description: str = Field(
+        ...,
+        min_length=110,
+        max_length=160,
+        description=(
+            "Meta description shown under the title in Google results. "
+            "Between 110 and 160 characters. One or two sentences with the "
+            "main benefit and an implicit call to action. Plain text only: "
+            "NO HTML tags."
+        ),
+    )
     audit_log: List[str] = Field(..., min_length=1, description="Specific reasons for changes.")
+
+    @model_validator(mode="after")
+    def seo_title_must_differ(self) -> "AIProposalOutput":
+        """seo_title y new_title son campos distintos de Shopify.
+
+        new_title es el H1 que ve el comprador; seo_title es el <title> del HTML
+        y el enlace azul en Google. Copiar uno en el otro desperdicia el campo.
+        Verificado el 2026-08-18: el escritor emitio ambos identicos y el Juez lo
+        aprobo. Un validador aqui deja que output_retries de pydantic-ai lo
+        corrija dentro del ciclo de escritura, que es barato.
+        """
+        if self.seo_title.strip().lower() == self.new_title.strip().lower():
+            raise ValueError(
+                "seo_title must not be identical to new_title. The SEO title "
+                "targets search intent with the primary keyword front-loaded; "
+                "the product title targets the buyer on the page."
+            )
+        return self
 
 class CriticFeedback(BaseModel):
     is_perfect: bool

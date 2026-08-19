@@ -58,6 +58,10 @@ class KatalogState(TypedDict, total=False):
     seo_score_raw: NotRequired[int]                # 0-100 (de shopify_products.seo_score_initial)
     seo_score_category: NotRequired[str]           # POOR | ACCEPTABLE | GOOD | EXCELLENT
     cached_specs: NotRequired[dict | None]         # specs del caché product_enrichment
+    # Hechos NIVEL 1: metafields estructurados de Shopify, verificados por
+    # definicion (los emite la plataforma). Distintos de cached_specs, que
+    # viene de busqueda web y es NIVEL 3/4.
+    verified_facts: NotRequired[list[str]]
     data_gaps: NotRequired[list[str]]              # gaps detectados (para el Investigador)
     available_skills: NotRequired[list[str]]       # nombres de skills disponibles
     fingerprint: NotRequired[str]                  # SHA-256 del producto base

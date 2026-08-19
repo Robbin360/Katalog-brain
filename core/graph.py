@@ -24,6 +24,7 @@ from core.helpers import (
     load_skills,
     get_available_skills,
     build_product_fingerprint,
+    extract_verified_facts,
     utc_now_iso,
 )
 from core.quality_gate import evaluate_rewrite
@@ -145,23 +146,38 @@ def _merchant_source_block(text: str) -> str:
 def _judge_verified_sources_block(state: KatalogState) -> str:
     """Fuentes verificadas para el Juez.
 
-    Prioridad:
-    1) dossier producido por el Investigador en ESTA corrida
-    2) cache preexistente (legacy fallback)
+    Bloque ACUMULATIVO, no excluyente: se muestran TODAS las fuentes que
+    existan, etiquetadas por nivel de confianza:
+    1) NIVEL 1: metafields de Shopify (los emite la plataforma, verificados
+       por definicion)
+    2) NIVEL 3: dossier producido por el Investigador en ESTA corrida
+    3) CACHE PREEXISTENTE (legacy fallback, NIVEL 3/4)
 
     El bug real del 1010 fue que el escritor recibió research_result pero el
     Juez miró cached_specs, que se calcula antes del investigador y puede
-    estar vacío o stale.
+    estar vacío o stale. Y los metafields (la fuente mas fiable) nunca se
+    mostraban: solo existia la rama del dossier o la del cache.
     """
+    blocks: list[str] = []
+
+    verified_facts = state.get("verified_facts") or []
+    if verified_facts:
+        facts_lines = "\n".join(f"- {f}" for f in verified_facts)
+        blocks.append(
+            f"## DATOS VERIFICADOS POR SHOPIFY (fuente NIVEL 1)\n"
+            f"Los emite la plataforma, no una busqueda. Hechos incuestionables:\n"
+            f"{facts_lines}"
+        )
+
     research_result = state.get("research_result")
     dossier_text = format_dossier_for_prompt(research_result)
     if dossier_text and dossier_text.strip():
-        return dossier_text
+        blocks.append(dossier_text)
 
     cached_specs = state.get("cached_specs")
     if cached_specs:
         try:
-            lines = ["## ESPECIFICACIONES TÉCNICAS (CACHE PREEXISTENTE)\n"]
+            lines = ["## ESPECIFICACIONES TÉCNICAS (CACHE PREEXISTENTE)"]
             for key, value in cached_specs.items():
                 if isinstance(value, dict):
                     val = value.get("value", "")
@@ -172,11 +188,14 @@ def _judge_verified_sources_block(state: KatalogState) -> str:
                         lines.append(f"- {key}: {val}")
                 else:
                     lines.append(f"- {key}: {value}")
-            return "\n".join(lines)
+            blocks.append("\n".join(lines))
         except Exception as e:
             print(f"⚠️ [Juez] No se pudo formatear cached_specs: {e}")
 
-    return "Sin specs verificadas"
+    if not blocks:
+        return "Sin specs verificadas"
+
+    return "\n\n".join(blocks)
 
 
 async def _run_sync(callable_obj):
@@ -848,6 +867,20 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     research_result = state.get("research_result")
 
     if plan:
+        # Hechos NIVEL 1: se inyectan SIEMPRE, exista dossier o no. Los emite
+        # Shopify, no una busqueda web: son los unicos datos tecnicos que el
+        # Juez acepta sin discusion (ver bucle de invencion del 1010).
+        verified_facts = state.get("verified_facts") or []
+        verified_block = ""
+        if verified_facts:
+            facts_lines = "\n".join(f"- {f}" for f in verified_facts)
+            verified_block = f"""
+    ## DATOS VERIFICADOS POR SHOPIFY (fuente NIVEL 1)
+    Estos datos los emite la plataforma, no una busqueda. Son hechos
+    incuestionables: usalos con total confianza y NO los pierdas.
+    {facts_lines}
+"""
+
         # Formatear dossier del Investigador (si existe)
         dossier_text = format_dossier_for_prompt(research_result) if research_result else ""
         if not dossier_text.strip():
@@ -866,6 +899,7 @@ async def audit_and_write_pydantic(state: KatalogState) -> dict[str, Any]:
     ESTRATEGIA: {plan.copywriter_instructions}
 """
         orchestrator_section += f"""
+    {verified_block}
     {dossier_text}
 """
         if loaded_skills:
@@ -984,16 +1018,22 @@ async def fetch_db_data_orchestrator(state: KatalogState) -> dict[str, Any]:
     seo_score_category = map_seo_score_to_category(seo_score_raw)
     available_skills   = get_available_skills()
 
+    # Hechos NIVEL 1: metafields estructurados de Shopify, verificados por
+    # definicion (los emite la plataforma). Fuente distinta y superior a
+    # cached_specs, que viene de busqueda web (NIVEL 3/4).
+    verified_facts = extract_verified_facts(product_dict.get("metafields"))
+
     print(
         f"\U0001f9e0 [Orq] Enriquecimiento: tipo={product_type_class}, "
         f"precio_rel={precio_relativo}, seo={seo_score_category}, "
-        f"specs={'SI' if cached_specs else 'NO'}, skills={len(available_skills)}"
+        f"specs={'SI' if cached_specs else 'NO'}, facts={len(verified_facts)}, skills={len(available_skills)}"
     )
 
     return {
         "product":            product_dict,
         "metrics":            metrics,
         "cached_specs":       cached_specs,
+        "verified_facts":     verified_facts,
         "precio_relativo":    precio_relativo,
         "product_type_class": product_type_class,
         "seo_score_raw":      seo_score_raw,
@@ -1212,13 +1252,25 @@ async def review_proposal(state: KatalogState) -> dict[str, Any]:
     Verify if the proposal follows all rules strictly.
     If it uses ANY forbidden words, reject it (is_perfect=False) and list them.
     If the title is over 70 chars, reject it.
+    Also verify the SEO fields:
+    - seo_title must front-load the primary keyword and not be a copy of a
+      generic phrase.
+    - seo_description must be plain text with NO HTML tags, and must state a
+      concrete benefit, not filler.
+    Reject if seo_description contains HTML markup.
     Provide actionable feedback for the writer to fix it.
     """
 
+    sources_present = []
+    if state.get("verified_facts"):
+        sources_present.append(f"verified_facts({len(state['verified_facts'])})")
+    if format_dossier_for_prompt(state.get("research_result")).strip():
+        sources_present.append("research_result")
+    if state.get("cached_specs"):
+        sources_present.append("cached_specs")
     print(
         "📚 [Nodo 4] Fuentes del Juez:",
-        "research_result" if format_dossier_for_prompt(state.get("research_result")).strip() else
-        ("cached_specs" if state.get("cached_specs") else "none"),
+        ", ".join(sources_present) if sources_present else "none",
     )
 
     # Inyectar instrucciones del Juez desde el Plan del Orquestador

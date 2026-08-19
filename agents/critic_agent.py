@@ -73,9 +73,10 @@ def pre_critic_checks(proposal: Any, rules: Any) -> None:
     proposal_dict = _to_dict(proposal)
     title = str(proposal_dict.get("new_title", ""))
     body_html = str(proposal_dict.get("new_body_html", ""))
-    seo_tags = str(proposal_dict.get("seo_tags", ""))
+    seo_title = str(proposal_dict.get("seo_title", ""))
+    seo_description = str(proposal_dict.get("seo_description", ""))
     forbidden_words = _get_attr_or_key(rules, "forbidden_words", []) or []
-    haystack = f"{title}\n{body_html}\n{seo_tags}".lower()
+    haystack = f"{title}\n{body_html}\n{seo_title}\n{seo_description}".lower()
 
     failures: list[str] = []
     if len(title) > 70:
