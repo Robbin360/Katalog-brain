@@ -1053,6 +1053,32 @@ async def do_not_harm_check(state: KatalogState) -> dict[str, Any]:
     product_id = int(state["product_id"])
     product    = state.get("product", {})
 
+    async def _update_status(update: dict) -> None:
+        await _run_sync(
+            lambda: supabase.table("shopify_products").update(update).eq("id", product_id).execute()
+        )
+
+    # 🎁 Producto no físico (tarjeta de regalo, digital, servicio): no tiene
+    # especificaciones que optimizar. Primera comprobación, antes de cualquier
+    # cálculo de ventas. Reusa STABLE_PERFORMING: es terminal, ya está en
+    # _SKIP_QUADRANTS, tiene badge y está fuera del filtro del Auto-Pilot. El
+    # error_log explica el motivo real. Caso real: producto 998, al que el
+    # optimizador le reescribió el copy como si fuera una tabla de snowboard.
+    product_class = state.get("product_type_class") or classify_product_type(product)
+    if product_class == "NON_PHYSICAL":
+        await _update_status({
+            "audit_status": QUADRANT_STABLE,
+            "error_log": (
+                "Excluido del optimizador: producto no fisico "
+                f"(tipo={product.get('product_type') or 'desconocido'}). "
+                "Las tarjetas de regalo y productos digitales no tienen "
+                "especificaciones que optimizar."
+            ),
+        })
+        await _refund_reservation(state, "do_not_harm:NON_PHYSICAL")
+        print(f"🎁 [Do-Not-Harm] {product_id} → excluido: producto no fisico")
+        return {"product_quadrant": QUADRANT_STABLE}
+
     sales_7d  = int(product.get("sales_last_7_days",  0) or 0)
     sales_30d = int(product.get("sales_last_30_days", 0) or 0)
     sales_90d = int(product.get("sales_last_90_days", 0) or 0)
@@ -1064,11 +1090,6 @@ async def do_not_harm_check(state: KatalogState) -> dict[str, Any]:
     is_dead          = sales_30d < 3
     is_poor_copy     = seo_score_raw < 40
     is_good_copy     = seo_score_raw >= 70
-
-    async def _update_status(update: dict) -> None:
-        await _run_sync(
-            lambda: supabase.table("shopify_products").update(update).eq("id", product_id).execute()
-        )
 
     if is_consistent and is_poor_copy and not is_viral_spike:
         await _update_status({"audit_status": QUADRANT_STABLE, "processing_heartbeat_at": None})

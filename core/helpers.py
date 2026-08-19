@@ -62,12 +62,30 @@ def get_available_skills() -> list[str]:
     return [f.stem for f in SKILLS_DIR.glob("*.json")]
 
 
+# Categorias que NO son productos fisicos con especificaciones. Un copy
+# "tecnico" para una tarjeta de regalo o una descarga digital es un sinsentido.
+NON_PHYSICAL_TYPES = {
+    "giftcard", "gift card", "gift-card", "digital", "download",
+    "service", "servicio", "suscripcion", "subscription",
+}
+
+
 def classify_product_type(product: dict) -> str:
     """
-    Clasifica el producto en MANUFACTURED, ARTISANAL o GENERIC.
+    Clasifica el producto en MANUFACTURED, ARTISANAL, NON_PHYSICAL o GENERIC.
     Usa datos deterministas de Shopify — sin LLM.
 
+    Precedencia (de mayor a menor señal):
+        barcode > SKU tecnico > NON_PHYSICAL > ARTISANAL > GENERIC
+
+    barcode y SKU tecnico son identidad del producto, no categoria, por eso
+    mandan sobre NON_PHYSICAL. La categoria (product_type) solo decide cuando
+    no hay identidad de fabrica.
+
     MANUFACTURED: tiene barcode O sku con patrón alfanumérico técnico
+    NON_PHYSICAL: product_type es una categoria sin especificaciones (tarjeta
+                  de regalo, digital, servicio). Compara en minusculas y
+                  tolera espacios y guiones.
     ARTISANAL:    sin barcode Y sin sku técnico Y señales de artesanal
     GENERIC:      todo lo demás
     """
@@ -88,6 +106,12 @@ def classify_product_type(product: dict) -> str:
     TECHNICAL_SKU_PATTERN = re.compile(r'[A-Z]{2,}\d{3,}|[A-Z]{2,}-\d{2,}', re.IGNORECASE)
     if sku and TECHNICAL_SKU_PATTERN.search(sku):
         return "MANUFACTURED"
+
+    # Categoría sin especificaciones físicas. Normaliza guiones a espacios
+    # para que "gift-card" y "gift card" caigan en la misma entrada.
+    normalized_type = product_type.replace("-", " ").strip()
+    if normalized_type in NON_PHYSICAL_TYPES:
+        return "NON_PHYSICAL"
 
     # Señales de producto artesanal
     ARTISANAL_KEYWORDS = {

@@ -31,7 +31,6 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from core.graph import katalog_agent
-from agents.inspector_agent import inspector_agent, build_inspector_prompt
 from core.auth import get_current_user_id
 from core.helpers import utc_now_iso
 
@@ -71,7 +70,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inicializamos Supabase Globalmente para usarlo en el Triaje
+# Inicializamos Supabase Globalmente para el sync y la cirugía mayor
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(supabase_url, supabase_key)
@@ -89,87 +88,7 @@ class OptimizeRequest(BaseModel):
 
 
 # ==========================================
-# ⚡ EL MOTOR DE TRIAJE (Trabajador en las sombras)
-# ==========================================
-async def process_triage_queue():
-    """Esta función corre en el fondo sin bloquear la web"""
-    print("🚨[TRIAJE BACKGROUND] Iniciando escaneo masivo de catálogo...")
-    
-    try:
-        # 1. Buscar hasta 10 productos que no han sido auditados
-        res = await run_sync_io(
-            lambda: supabase.table('shopify_products')
-            .select('id, current_title, current_body_html')
-            .eq('audit_status', 'PENDING_AUDIT')
-            .limit(10)
-            .execute()
-        )
-        products = res.data
-        
-        if not products:
-            print("✅ [TRIAJE BACKGROUND] Nada que auditar.")
-            return
-
-        print(f"📦 Procesando {len(products)} productos a velocidad de Radar (Max 4 por minuto)...")
-
-        # 2. Auditar cada producto controlando la velocidad
-        for prod in products:
-            prompt = build_inspector_prompt(prod.get('current_title'), prod.get('current_body_html'))
-            
-            print(f"👀 Auditando: {prod.get('current_title')[:30]}...")
-            
-            # Llamamos al Inspector Flash
-            result = await inspector_agent.run(prompt)
-            # Extracción blindada de Pydantic
-            audit_data = getattr(result, 'data', getattr(result, 'output', result))
-            
-            # 3. Guardar el veredicto en Supabase al instante
-            _score = audit_data.score
-            _reason = audit_data.reason
-            _product_id = prod['id']
-            _new_status = 'NEEDS_OPTIMIZATION' if _score < 90 else 'READY_TO_PUBLISH'
-
-            async def _save_audit(s=_score, r=_reason, pid=_product_id, ns=_new_status):
-                def _update():
-                    supabase.table('shopify_products').update({
-                        'seo_score_initial': s,
-                        'audit_score': s,
-                        'last_audit_at': utc_now_iso(),
-                        'error_log': r,
-                        'audit_status': ns,
-                    }).eq('id', pid).execute()
-                await asyncio.to_thread(_update)
-            await _save_audit()
-            print("⏳ Enfriando motor por 15 segundos para evitar ban de API...")
-            await asyncio.sleep(15)
-
-        print("🏁 [TRIAJE BACKGROUND] Lote terminado exitosamente.")
-
-    except Exception as e:
-        print(f"❌ [TRIAJE BACKGROUND] Error Fatal: {str(e)}")
-
-
-# ==========================================
-# ⚡ ENDPOINT 1: DISPARADOR DEL TRIAJE
-# ==========================================
-@app.post("/api/triage")
-async def run_triage_scan(
-    background_tasks: BackgroundTasks,
-    user_id: str = Depends(get_current_user_id),
-):
-    # En lugar de hacer esperar al usuario, le pasamos el trabajo al empleado de fondo
-    background_tasks.add_task(process_triage_queue)
-    
-    # Respondemos en 0.01 segundos
-    return {
-        "status": "ACCEPTED", 
-        "message": "Triaje iniciado en segundo plano. Escaneando a 4 productos por minuto.",
-        "user_id": user_id,
-    }
-
-
-# ==========================================
-# 🧠 ENDPOINT 2: CIRUGÍA MAYOR (LANGGRAPH)
+# 🧠 ENDPOINT 1: CIRUGÍA MAYOR (LANGGRAPH)
 # ==========================================
 @app.post("/api/optimize")
 async def optimize_product(

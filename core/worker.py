@@ -5,7 +5,6 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import stripe
-from agents.inspector_agent import inspector_agent, build_inspector_prompt
 from core.graph import katalog_agent, supabase
 from core.helpers import utc_now_iso
 
@@ -191,11 +190,10 @@ async def auto_pilot_patrol() -> None:
     Definitive background worker for Katalog Auto-Pilot.
     Executes a structured 4-phase cycle:
       - Phase 0: Zombie Sweeper (Global maintenance)
-      - Phase 0.5: Auto-Triaje Autónomo (Lead Magnet)
       - Phase 2: Credit Gate (Business filter)
       - Phase 3: Auto-Pilot Optimizer (Heavy optimization)
     """
-    print("🤖 [Auto-Pilot] Worker iniciado con arquitectura de 4 fases.")
+    print("🤖 [Auto-Pilot] Worker iniciado con arquitectura de fases.")
 
     while True:
         # ==========================================
@@ -276,63 +274,6 @@ async def auto_pilot_patrol() -> None:
                 print(f"🧟 [Zombie Sweeper] {len(zombies)} zombies devueltos a la cola de errores.")
         except Exception as sweeper_error:
             print(f"⚠️ [Zombie Sweeper] Error durante la fase de recuperación: {sweeper_error}")
-
-        # ==========================================
-        # 🔍 FASE 0.5: Auto-Triaje Autónomo (Lead Magnet - Para todos)
-        # ==========================================
-        try:
-            pending_res = await _run_sync(
-                lambda: supabase.table("shopify_products")
-                .select("id,current_title,current_body_html")
-                .eq("audit_status", "PENDING_AUDIT")
-                .limit(3)
-                .execute()
-            )
-            pending_products: list[dict[str, Any]] = pending_res.data or []
-            
-            if pending_products:
-                print(f"🔍 [Auto-Triaje] {len(pending_products)} productos en PENDING_AUDIT detectados para análisis rápido.")
-                for idx, prod in enumerate(pending_products):
-                    prod_id = prod.get("id")
-                    title = prod.get("current_title") or ""
-                    body_html = prod.get("current_body_html") or ""
-                    
-                    if not prod_id:
-                        continue
-                    
-                    print(f"👀 [Auto-Triaje] Evaluando: {title[:30]}...")
-                    prompt = build_inspector_prompt(title, body_html)
-                    
-                    # Llamamos al inspector_agent de forma asíncrona
-                    result = await inspector_agent.run(prompt)
-                    audit_data = getattr(result, "data", getattr(result, "output", result))
-                    
-                    score = _to_int(getattr(audit_data, "score", 0))
-                    reason = str(getattr(audit_data, "reason", "Sin justificación."))
-                    status = "OPTIMIZED" if score >= 90 else "NEEDS_OPTIMIZATION"
-                    
-                    # Guardamos el veredicto en Supabase
-                    await _run_sync(
-                        lambda pid=prod_id, s=score, r=reason, st=status: supabase.table("shopify_products")
-                        .update({
-                            "seo_score_initial": s,
-                            "audit_score": s,
-                            "last_audit_at": utc_now_iso(),
-                            "error_log": r,
-                            "audit_status": st,
-                            "updated_at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                        }, returning="representation")
-                        .eq("id", pid)
-                        .execute()
-                    )
-                    print(f"✅ [Auto-Triaje] Producto ID {prod_id} auditado. Score: {score}/100 | Status: {status}")
-                    
-                    # Rate Limit Guard: Esperar 15s entre productos si es un lote con más de uno
-                    if len(pending_products) > 1 and idx < len(pending_products) - 1:
-                        print("⏳ [Auto-Triaje] Enfriando motor por 15 segundos para evitar límite de cuota...")
-                        await asyncio.sleep(15)
-        except Exception as triage_error:
-            print(f"⚠️ [Auto-Triaje] Error durante el triaje autónomo: {triage_error}")
 
         # ==========================================
         # 🚦 FASE 2: El Peaje de Créditos (Filtro de Negocio)

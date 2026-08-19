@@ -90,3 +90,28 @@ def test_classify_product_type_acepta_product_type_y_productType():
     }
     assert classify_product_type(row) == "ARTISANAL"
     assert classify_product_type(raw_payload) == "ARTISANAL"
+
+
+# ---------------------------------------------------------------------
+# classify_product_type: NON_PHYSICAL (categorías sin especificaciones)
+# ---------------------------------------------------------------------
+
+def test_classify_product_type_giftcard_no_fisico():
+    product = {"product_type": "giftcard", "tags": [], "barcode": "", "sku": ""}
+    assert classify_product_type(product) == "NON_PHYSICAL"
+
+
+def test_classify_product_type_gift_card_mayusculas_con_espacio():
+    product = {"product_type": "Gift Card", "tags": [], "barcode": "", "sku": ""}
+    assert classify_product_type(product) == "NON_PHYSICAL"
+
+
+def test_classify_product_type_snowboard_generic():
+    product = {"product_type": "snowboard", "tags": [], "barcode": "", "sku": ""}
+    assert classify_product_type(product) == "GENERIC"
+
+
+def test_classify_product_type_barcode_manda_sobre_giftcard():
+    """barcode es identidad, no categoria: manda sobre NON_PHYSICAL."""
+    product = {"product_type": "giftcard", "tags": [], "barcode": "0072358", "sku": ""}
+    assert classify_product_type(product) == "MANUFACTURED"
