@@ -31,7 +31,19 @@ from core.quality_gate import evaluate_rewrite
 from core.deterministic_score import strip_html_to_text
 from core.schemas import BrandRules, ProductContext, OrchestratorPlan
 from core.shopify_tools import publish_to_shopify as publish_product_to_shopify
+from core.shopify_tools import get_product_copy
 from core.shopify_api import get_product_taxonomy
+from core.publish_recovery import (
+    MAX_PUBLISH_ATTEMPTS,
+    PUBLISH_STAGE_PERSIST,
+    PUBLISH_STAGE_SETUP,
+    PUBLISH_STAGE_UPDATE,
+    PUBLISH_STAGE_VERIFY,
+    PublishFailure,
+    classify_publish_error,
+    publish_next_retry_iso,
+    record_publish_failure,
+)
 from core.state import KatalogState
 
 load_dotenv()
@@ -680,6 +692,7 @@ async def fetch_db_data(state: KatalogState) -> dict[str, Any]:
             "auto_pilot_enabled": auto_pilot_enabled,
             "current_status": current_status,
             "retry_attempts": _to_int(product_data.get("retry_attempts")),
+            "publish_attempts": _to_int(product_data.get("publish_attempts")),
             "product_context": context,
             "brand_rules": rules,
             "taxonomy_context": taxonomy_text,
@@ -1546,8 +1559,94 @@ async def mark_needs_optimization(state: KatalogState) -> dict[str, Any]:
 
 
 # ==========================================
-# 🚀 NODO 6: PUBLICAR EN SHOPIFY
+# 🚀 NODO 6: PUBLICAR EN SHOPIFY (seguro y recuperable)
 # ==========================================
+async def _handle_publish_failure(
+    state: KatalogState,
+    product_id: str,
+    user_id: str,
+    failure: PublishFailure,
+    shopify_confirmed: bool,
+) -> None:
+    """Persiste un fallo de publicación: RPC estructurado + transición de estado.
+
+    - Reintentable con intentos disponibles → READY_TO_PUBLISH con
+      publish_next_retry_at (la propuesta sigue aprobada y pagada; el
+      Auto-Pilot la vuelve a tomar cuando vence la ventana).
+    - Permanente o intentos agotados → ERROR con retry_attempts=3 para
+      congelarlo fuera del filtro del Auto-Pilot.
+
+    El optimizado se entregó y se pagó en el gate: NO se reembolsa aquí. La
+    compensación del sistema de fallos solo se avisa en el caso terminal.
+    """
+    attempts_now = _to_int(state.get("publish_attempts")) + 1
+    next_retry_at = None
+    keep_in_queue = failure.retryable and attempts_now < MAX_PUBLISH_ATTEMPTS
+    if keep_in_queue:
+        next_retry_at = publish_next_retry_iso(attempts_now)
+
+    try:
+        await record_publish_failure(
+            user_id=user_id,
+            product_id=int(product_id),
+            failure=failure,
+            next_retry_at=next_retry_at,
+            shopify_confirmed=shopify_confirmed,
+        )
+        print(
+            f"🧯 [Nodo 6] Fallo registrado: code={failure.code} "
+            f"stage={failure.stage} retryable={failure.retryable} "
+            f"next_retry_at={next_retry_at}"
+        )
+    except Exception as rpc_error:
+        print(f"⚠️ [Nodo 6] No se pudo registrar el fallo de publicación: {rpc_error}")
+
+    error_log = f"[publish:{failure.code}] {failure.message}"
+
+    if keep_in_queue:
+        await _run_sync(
+            lambda: supabase.table("shopify_products")
+            .update({
+                "audit_status": STATUS_READY_TO_PUBLISH,
+                "error_log": error_log,
+                "processing_heartbeat_at": None,
+                "updated_at": utc_now_iso(),
+            })
+            .eq("id", product_id)
+            .execute()
+        )
+        print(
+            f"🔄 [Nodo 6] Fallo reintentable ({failure.code}): producto "
+            f"{product_id} queda en READY_TO_PUBLISH (reintento en {next_retry_at})."
+        )
+        return
+
+    try:
+        await _run_sync(
+            lambda: supabase.rpc("record_product_failure_and_maybe_compensate", {
+                "p_user_id": user_id,
+                "p_product_id": int(product_id),
+            }).execute()
+        )
+    except Exception as comp_error:
+        print(f"⚠️ [Nodo 6] Error registrando fallo consecutivo: {comp_error}")
+
+    await _run_sync(
+        lambda: supabase.table("shopify_products")
+        .update({
+            "audit_status": STATUS_ERROR,
+            "error_log": error_log,
+            "retry_attempts": 3,
+            "next_retry_at": None,
+            "processing_heartbeat_at": None,
+            "updated_at": utc_now_iso(),
+        })
+        .eq("id", product_id)
+        .execute()
+    )
+    print(f"⛔ [Nodo 6] Fallo permanente ({failure.code}): producto {product_id} congelado en ERROR.")
+
+
 async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
     print("🚀 [Nodo 6] Auto-Pilot publicando en Shopify...")
 
@@ -1558,8 +1657,16 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
 
     if state.get("error"):
         return {}
+
     if not proposal or not context or not user_id:
-        return {"error": "Faltan datos para publicar en Shopify."}
+        # Invariante rota del grafo: no hay forma segura de reintentar.
+        failure = classify_publish_error(
+            ValueError("Faltan datos para publicar en Shopify."), PUBLISH_STAGE_SETUP
+        )
+        await _handle_publish_failure(
+            state, product_id, str(user_id or ""), failure, shopify_confirmed=False
+        )
+        return {"error": failure.message, "status": STATUS_ERROR}
 
     proposal_dict = _proposal_to_dict(proposal)
     title = proposal_dict.get("new_title", "")
@@ -1567,7 +1674,14 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
     metadata = _optimization_metadata(state, proposal_dict, html)
 
     if not title or not html:
-        return {"error": "La propuesta aprobada no contiene título o descripción HTML."}
+        failure = classify_publish_error(
+            ValueError("La propuesta aprobada no contiene título o descripción HTML."),
+            PUBLISH_STAGE_SETUP,
+        )
+        await _handle_publish_failure(
+            state, product_id, str(user_id), failure, shopify_confirmed=False
+        )
+        return {"error": failure.message, "status": STATUS_ERROR}
 
     try:
         integration_res = await _run_sync(
@@ -1590,15 +1704,60 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
             lambda: supabase.rpc("decrypt_shopify_token", {"p_ciphertext_b64": encrypted_token}).execute()
         )
         access_token = decrypted_res.data
+    except Exception as e:
+        # Sin credenciales válidas el reintento no tiene sentido: congela.
+        failure = classify_publish_error(e, PUBLISH_STAGE_SETUP)
+        await _handle_publish_failure(
+            state, product_id, str(user_id), failure, shopify_confirmed=False
+        )
+        return {"error": failure.message, "status": STATUS_ERROR}
 
-        await publish_product_to_shopify(
+    # 1) Verificación idempotente: si el contenido aprobado ya está aplicado
+    #    (caída entre Shopify y la DB en un intento anterior con
+    #    shopify_confirmed=True), no reescribimos: solo completamos el
+    #    bookkeeping. Hace los reintentos seguros por diseño.
+    try:
+        current_copy = await get_product_copy(
             shop_url=integration_data.get("shop_url", ""),
             access_token=access_token,
             product_shopify_id=context.shopify_id,
-            title=title,
-            html=html,
+        )
+        already_applied = (
+            current_copy.get("title") == title
+            and current_copy.get("descriptionHtml") == html
+        )
+    except Exception as e:
+        failure = classify_publish_error(e, PUBLISH_STAGE_VERIFY)
+        await _handle_publish_failure(
+            state, product_id, str(user_id), failure, shopify_confirmed=False
+        )
+        return {"error": failure.message, "status": STATUS_ERROR}
+
+    if not already_applied:
+        try:
+            await publish_product_to_shopify(
+                shop_url=integration_data.get("shop_url", ""),
+                access_token=access_token,
+                product_shopify_id=context.shopify_id,
+                title=title,
+                html=html,
+            )
+        except Exception as e:
+            failure = classify_publish_error(e, PUBLISH_STAGE_UPDATE)
+            await _handle_publish_failure(
+                state, product_id, str(user_id), failure, shopify_confirmed=False
+            )
+            return {"error": failure.message, "status": STATUS_ERROR}
+    else:
+        print(
+            "♻️ [Nodo 6] El contenido aprobado ya está aplicado en Shopify. "
+            "Recuperación idempotente sin re-escritura."
         )
 
+    # 2) De aquí en adelante Shopify TIENE el contenido (confirmado). Solo
+    #    falta la persistencia local: si falla, el reintento detectará el
+    #    contenido aplicado y completará el bookkeeping sin reescribir.
+    try:
         published_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         await _run_sync(lambda: supabase.table("shopify_products").update({
             "audit_status": STATUS_OPTIMIZED,
@@ -1609,28 +1768,55 @@ async def publish_to_shopify_node(state: KatalogState) -> dict[str, Any]:
             "retry_attempts": 0,
             "next_retry_at": None,
             "processing_heartbeat_at": None,
+            # Limpieza del estado de publicación: un siguiente publish parte
+            # de cero (publish_attempts=0 → reintento inmediato si se reabre).
+            "publish_attempts": 0,
+            "publish_next_retry_at": None,
+            "publish_error_code": None,
+            "publish_error_stage": None,
+            "publish_error_retryable": False,
+            "publish_error_at": None,
+            "publish_error_details": None,
         }, returning="representation").eq("id", product_id).execute())
 
-        await _run_sync(lambda: supabase.table("optimizations").insert({
-            "user_id": user_id,
-            "product_id": product_id,
-            "title_generated": title,
-            "description_generated": html,
-            "title_previous": context.current_title,
-            "description_previous": context.current_body_html,
-            "framework_used": metadata["framework_used"],
-            "tone_used": metadata["tone_used"],
-            "description_length": metadata["description_length"],
-            "status": "published",
-        }).execute())
+        # Guarda contra duplicados tras reintentos: solo un registro
+        # "published" por producto.
+        opt_res = await _run_sync(
+            lambda: supabase.table("optimizations")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("product_id", product_id)
+            .eq("status", "published")
+            .limit(1)
+            .execute()
+        )
+        if not (opt_res.data or []):
+            await _run_sync(lambda: supabase.table("optimizations").insert({
+                "user_id": user_id,
+                "product_id": product_id,
+                "title_generated": title,
+                "description_generated": html,
+                "title_previous": context.current_title,
+                "description_previous": context.current_body_html,
+                "framework_used": metadata["framework_used"],
+                "tone_used": metadata["tone_used"],
+                "description_length": metadata["description_length"],
+                "status": "published",
+            }).execute())
 
-        # ✅ Sin lógica de créditos aquí. El cobro ya ocurrió en save_to_supabase.
-        print(f"✅ [Nodo 6] Producto {product_id} publicado y marcado como OPTIMIZED.")
-        return {"status": STATUS_OPTIMIZED, "retry_attempts": 0}
+        # Cobro solo si quedó pendiente (crash entre gate y commit): el RPC
+        # es idempotente, no dobla cobro si ya estaba COMMITTED.
+        await _commit_reservation(state, "publish_confirmed")
     except Exception as e:
-        error_message = _format_error_for_log(e)
-        print(f"❌ [Nodo 6] Error publicando producto {product_id}: {error_message}")
-        return {"error": error_message}
+        failure = classify_publish_error(e, PUBLISH_STAGE_PERSIST)
+        failure.retryable = True  # Shopify ya aplicó el contenido; falta solo la DB
+        await _handle_publish_failure(
+            state, product_id, str(user_id), failure, shopify_confirmed=True
+        )
+        return {"error": failure.message, "status": STATUS_ERROR}
+
+    print(f"✅ [Nodo 6] Producto {product_id} publicado y marcado como OPTIMIZED.")
+    return {"status": STATUS_OPTIMIZED, "retry_attempts": 0}
 
 
 # ==========================================
@@ -1734,7 +1920,12 @@ def route_after_save(state: KatalogState) -> str:
 
 
 def route_after_publish(state: KatalogState) -> str:
-    return "error_handler" if state.get("error") else "end"
+    """El Nodo 6 es autónomo: maneja sus propios fallos (RPC + transición de
+    estado). Un error que llegue aquí YA fue persistido por el nodo; llevarlo
+    al error_handler lo pisaría con el marcado genérico (ERROR + retry bump +
+    refund improcedente sobre un crédito ya comprometido en el gate).
+    """
+    return "end"
 
 
 def route_after_needs_optimization(state: KatalogState) -> str:
@@ -1881,7 +2072,7 @@ def build_graph():
     workflow.add_conditional_edges(
         "publish_to_shopify",
         route_after_publish,
-        {"error_handler": "error_handler", "end": END},
+        {"end": END},
     )
     workflow.add_conditional_edges(
         "needs_optimization",

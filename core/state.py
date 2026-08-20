@@ -16,6 +16,9 @@ class KatalogState(TypedDict, total=False):
     auto_pilot_enabled: NotRequired[bool]
     current_status: NotRequired[str]
     retry_attempts: NotRequired[int]
+    # Intentos de publicación ya fallidos (shopify_products.publish_attempts).
+    # Lo carga fetch_db_data; el Nodo 6 lo usa para backoff y tope de reintentos.
+    publish_attempts: NotRequired[int]
     product_context: NotRequired[ProductContext]
     brand_rules: NotRequired[BrandRules]
 
