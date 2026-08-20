@@ -1,5 +1,6 @@
 import os
 import re
+import uuid
 import asyncio
 import sys
 from collections.abc import AsyncIterator
@@ -88,11 +89,53 @@ class OptimizeRequest(BaseModel):
 
 
 # ==========================================
-# 🧠 ENDPOINT 1: CIRUGÍA MAYOR (LANGGRAPH)
+# 🧠 ENDPOINT 1: CIRUGÍA MAYOR (LANGGRAPH) — 202 Accepted + Polling
 # ==========================================
+async def run_grafo_background(job_id: str, product_id: str) -> None:
+    """Ejecuta el grafo en segundo plano, DESPUÉS de que la respuesta 202 ya
+    viaja al cliente. El request HTTP nunca espera al grafo: el estado se
+    persiste en shopify_products.audit_status y el cliente lo consulta por
+    polling.
+
+    - Éxito: el propio grafo escribe el estado final (READY_TO_PUBLISH,
+      NEEDS_OPTIMIZATION, cuadrantes, etc.) en save_db.
+    - Falla: escribimos ERROR aquí, con guard atómico sobre PROCESSING para
+      no pisar un estado que el grafo ya alcanzó (ej. OUT_OF_CREDITS).
+    No hay scoped_session que cerrar: el cliente Supabase es global y todos
+    los llamados van por asyncio.to_thread.
+    """
+    try:
+        print(f"🎬 [Job {job_id}] Grafo iniciado para producto {product_id}")
+        final_state = await katalog_agent.ainvoke({"product_id": product_id})
+
+        if final_state.get("error"):
+            raise RuntimeError(str(final_state["error"]))
+
+        print(f"✅ [Job {job_id}] Grafo terminado para producto {product_id}")
+    except Exception as e:
+        error_message = str(e)
+        print(f"❌ [Job {job_id}] Grafo falló para producto {product_id}: {error_message}")
+        try:
+            await run_sync_io(
+                lambda: supabase.table('shopify_products')
+                .update({
+                    "audit_status": "ERROR",
+                    "error_log": error_message,
+                    "processing_heartbeat_at": None,
+                })
+                .eq("id", product_id)
+                .eq("audit_status", "PROCESSING")
+                .execute()
+            )
+            print(f"❌ [Job {job_id}] Estado ERROR persistido para producto {product_id}")
+        except Exception as write_error:
+            print(f"⚠️ [Job {job_id}] No se pudo persistir ERROR para {product_id}: {write_error}")
+
+
 @app.post("/api/optimize")
 async def optimize_product(
     request: OptimizeRequest,
+    background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
 ):
     clean_id = str(request.product_id)
@@ -122,23 +165,45 @@ async def optimize_product(
                 detail="No tienes permiso para optimizar este producto."
             )
 
-        if current_status in ("OPTIMIZED", "READY_TO_PUBLISH"):
+        if current_status in ("OPTIMIZED", "READY_TO_PUBLISH", "PROCESSING"):
             raise HTTPException(
                 status_code=409,
-                detail=f"Producto ya está {current_status}. No se puede re-optimizar."
+                detail=f"Producto ya está {current_status}. No se puede optimizar ahora."
             )
 
-        initial_state = {"product_id": clean_id}
-        final_state = await katalog_agent.ainvoke(initial_state)
+        if not current_status:
+            raise HTTPException(
+                status_code=409,
+                detail="El producto no tiene un estado de auditoría válido."
+            )
 
-        if final_state.get("error"):
-            print(f"⚠️ [Grafo] Error detectado en el flujo: {final_state['error']}")
-            raise HTTPException(status_code=500, detail=final_state["error"])
+        # Claim atómico (compare-and-swap): solo el request que gane la
+        # condición pasa el producto a PROCESSING. Si dos peticiones llegan
+        # simultáneas, la segunda actualiza 0 filas → 409 Conflict.
+        job_id = str(uuid.uuid4())
+        claimed = await run_sync_io(
+            lambda: supabase.table('shopify_products')
+            .update({
+                "audit_status": "PROCESSING",
+                "processing_heartbeat_at": utc_now_iso(),
+            }, returning="representation")
+            .eq("id", clean_id)
+            .eq("audit_status", current_status)
+            .execute()
+        )
+        if not (claimed.data or []):
+            raise HTTPException(
+                status_code=409,
+                detail="El producto ya está en cola de optimización. Espera a que termine."
+            )
+
+        # El grafo corre en segundo plano; el 202 sale ya, en <1s.
+        background_tasks.add_task(run_grafo_background, job_id, clean_id)
 
         return {
-            "status": "SUCCESS",
-            "message": "Asset optimized successfully",
-            "data": final_state.get("final_proposal")
+            "status": "accepted",
+            "job_id": job_id,
+            "message": "Optimization queued",
         }
 
     except HTTPException:
